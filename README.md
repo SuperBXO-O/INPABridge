@@ -1,6 +1,6 @@
 # INPA Bridge
 
-FFXIV 插件（Dalamud）。为 **INPA 前台帮手** 提供游戏内联动能力：
+FFXIV 插件（Dalamud）。为 **FF14 RP Front Desk Helper** 提供游戏内联动能力：
 
 - 在内嵌浏览器里打开本机前台页面（`http://127.0.0.1:18500`）
 - 取当前目标（`名字@服务器`）
