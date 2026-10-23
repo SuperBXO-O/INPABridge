@@ -1,0 +1,39 @@
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
+
+  <!--
+    Dalamud.NET.Sdk 自动引用 Dalamud / Lumina / FFXIVClientStructs，
+    并按下面字段生成插件清单 json。目标：Dalamud API 15 / .NET 10 / FFXIV 7.5。
+  -->
+
+  <PropertyGroup>
+    <Version>1.7.81.0</Version>
+
+    <Name>INPA Bridge</Name>
+    <Author>INPA</Author>
+    <Punchline>为 INPA 前台帮手提供游戏联动：取目标 / 私聊 / 内嵌页面 / 背包 / 自动交易</Punchline>
+    <Description>把前台帮手网页从本机 127.0.0.1:18500 发给游戏内浏览器加载，并提供取目标（名字@服务器）、代发聊天、读取背包、自动交易（放信物 / 金币）与交易事件回报。只在网页里点击时动作，不后台自动操作。</Description>
+    <RepoUrl>https://github.com/SuperBXO-O/INPABridge</RepoUrl>
+    <Tags>utility;inpa</Tags>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <!-- 本机便携版卫月：SDK 默认去 %APPDATA%\XIVLauncher 找 Dalamud，这里补一条便携版路径。
+         GitHub Actions 上该路径不存在，条件自动跳过，改走 SDK 默认解析。 -->
+    <DalamudLibPath Condition="!Exists('$(DalamudLibPath)') And Exists('D:\FF14\XIVLauncherCN-data\XIVLauncherCN\addon\Hooks\dev')">D:\FF14\XIVLauncherCN-data\XIVLauncherCN\addon\Hooks\dev\</DalamudLibPath>
+    <AssemblySearchPaths>$(AssemblySearchPaths);$(DalamudLibPath)</AssemblySearchPaths>
+
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>INPABridge</AssemblyName>
+    <RootNamespace>INPABridge</RootNamespace>
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <NoWarn>$(NoWarn);CS1591;CS8625;CS8600;CS8602;CS8604;CS8618;CS8629;CS0168;CS0219</NoWarn>
+  </PropertyGroup>
+
+</Project>

@@ -1,0 +1,27 @@
+[
+  {
+    "Author": "INPA",
+    "Name": "INPA Bridge",
+    "Punchline": "为 INPA 前台帮手提供游戏联动：取目标 / 私聊 / 内嵌页面 / 背包 / 自动交易",
+    "Description": "把前台帮手网页从本机 127.0.0.1:18500 发给游戏内浏览器加载，并提供取目标（名字@服务器）、代发聊天、读取背包、自动交易（放信物 / 金币）与交易事件回报。只在网页里点击时动作，不后台自动操作。",
+    "InternalName": "INPABridge",
+    "AssemblyVersion": "1.7.81.0",
+    "RepoUrl": "https://github.com/SuperBXO-O/INPABridge",
+    "ApplicableVersion": "any",
+    "DalamudApiLevel": 15,
+    "Tags": ["utility", "inpa"],
+    "CategoryTags": ["utility"],
+    "IsHide": false,
+    "IsTestingExclusive": false,
+    "DownloadLink": "https://github.com/SuperBXO-O/INPABridge/releases/latest/download/latest.zip",
+    "LastUpdate": 0,
+    "DownloadCount": 0,
+    "IconUrl": "",
+    "ImageUrls": [],
+    "LoadPriority": 0,
+    "LoadRequiredState": 0,
+    "LoadSync": false,
+    "CanUnloadAsync": false,
+    "AcceptsFeedback": true
+  }
+]

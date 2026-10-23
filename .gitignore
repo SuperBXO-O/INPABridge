@@ -1,0 +1,18 @@
+# 构建产物
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# 本地发布包（走 GitHub Release，不进版本库）
+releases/
+*.zip
+
+# 备份文件
+*.bak
+*.bak-*
+
+# 运行时数据（含令牌与营业数据，绝不入库）
+data/
+*.log
