@@ -539,7 +539,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 				{
 					ok = true,
 					name = "INPA Bridge",
-					version = "1.7.81",
+					version = "1.7.84",
 					api = 15,
 					port = 18500,
 					bound = boundPrefix
@@ -1127,7 +1127,15 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 				string text2 = File.ReadAllText(path).Trim().Trim('"', '\ufeff');
 				if (text2.Length > 0)
 				{
-					list.Add(Directory.Exists(text2) ? Path.Combine(text2, "app.html") : text2);
+					if (Directory.Exists(text2))
+					{
+						list.Add(Path.Combine(text2, "app.html"));
+						list.Add(Path.Combine(text2, "index.html"));
+					}
+					else
+					{
+						list.Add(text2);
+					}
 				}
 			}
 		}
@@ -1135,7 +1143,9 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		{
 		}
 		list.Add(Path.Combine(text, "app.html"));
+		list.Add(Path.Combine(text, "index.html"));
 		list.Add(Path.Combine(text, "www", "app.html"));
+		list.Add(Path.Combine(text, "www", "index.html"));
 		foreach (string item in list)
 		{
 			try
@@ -1167,8 +1177,19 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 
 		var current = ResolvePagePath();
 		Add(current);
+		try
+		{
+			var webRoot = WebDataRoot(webProfile);
+			Add(Path.Combine(webRoot, "app.html"));
+			Add(Path.Combine(webRoot, "index.html"));
+			Add(Path.Combine(webRoot, "上传用", "index.html"));
+		}
+		catch { }
 		var pluginDir = PluginDirectory();
 		Add(Path.Combine(pluginDir, "app.html"));
+		Add(Path.Combine(pluginDir, "index.html"));
+		Add(Path.Combine(pluginDir, "www", "app.html"));
+		Add(Path.Combine(pluginDir, "www", "index.html"));
 		Add(Path.Combine(pluginDir, "www", webProfile, "app.html"));
 		Add(Path.Combine(pluginDir, "www", webProfile, "index.html"));
 		try
@@ -1207,7 +1228,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		string text = PluginDirectory();
 		string text2 = WebUtility.HtmlEncode(text);
 		string text3 = WebUtility.HtmlEncode(Path.Combine(text, "page.txt"));
-		return "<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\"><title>INPA 前台帮手 · 未找到页面</title></head><body style=\"background:#1a1420;color:#e8e0f0;font:14px/1.9 'Microsoft YaHei',sans-serif;padding:40px\"><h2 style=\"color:#e0b563\">没有找到 app.html</h2><p>把 <b>app.html</b> 放到下面这个目录，然后刷新本页：</p><pre style=\"background:#241d2b;padding:12px;border-radius:8px;white-space:pre-wrap\">" + text2 + "</pre><p>或者建一个 <b>page.txt</b>（就在同一目录），里面只写一行：app.html 的完整路径。</p><pre style=\"background:#241d2b;padding:12px;border-radius:8px;white-space:pre-wrap\">" + text3 + "</pre><p style=\"color:#9a8fb0\">路径示例：D:\\你放这个文件夹的位置\\app.html</p></body></html>";
+		return "<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\"><title>INPA 前台帮手 · 未找到页面</title></head><body style=\"background:#1a1420;color:#e8e0f0;font:14px/1.9 'Microsoft YaHei',sans-serif;padding:40px\"><h2 style=\"color:#e0b563\">没有找到 app.html 或 index.html</h2><p>把 <b>app.html</b> 或 <b>index.html</b> 放到下面这个目录，然后刷新本页：</p><pre style=\"background:#241d2b;padding:12px;border-radius:8px;white-space:pre-wrap\">" + text2 + "</pre><p>也可以创建 <b>page.txt</b>（与插件 DLL 同目录），写入页面文件完整路径，或写入页面所在文件夹路径。</p><pre style=\"background:#241d2b;padding:12px;border-radius:8px;white-space:pre-wrap\">" + text3 + "</pre><p style=\"color:#9a8fb0\">文件示例：D:\\你放这个文件夹的位置\\index.html<br>目录示例：D:\\你放这个文件夹的位置</p></body></html>";
 	}
 
 	private async Task WritePageAsync(HttpListenerResponse res, string webProfile)
@@ -1219,7 +1240,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 			if (lastPageLogged != "<none>")
 			{
 				lastPageLogged = "<none>";
-				Log.Warning("INPA Bridge: 没找到 app.html。请放到 {0}，或在该目录建 page.txt 写上路径。", new object[1] { PluginDirectory() });
+				Log.Warning("INPA Bridge: 没找到 app.html 或 index.html。请放到 {0}，或在插件目录创建 page.txt 写上页面文件或文件夹路径。", new object[1] { PluginDirectory() });
 			}
 			res.StatusCode = 404;
 			array = Encoding.UTF8.GetBytes(NotFoundHtml());
@@ -3180,7 +3201,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 	private static Vector4 fieldPageFocus = new Vector4(1f, 0.98f, 0f, 1f);
 	private static float fieldPageRadius = 4f;
 	private static bool fieldFontWarm;
-	private static int fieldLayoutMode;                 // 0=自动识别，1=黑黄，2=蓝白，3=橙白
+	private static int fieldLayoutMode;                 // 0=自动识别，1=黑黄，2=蓝白，3=橙白，4=霓虹青
 	private static string fieldDetectedProfile = "";
 	private static bool fieldLayoutLoaded;
 	private static string fieldPh = "";
@@ -3207,12 +3228,17 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		return string.IsNullOrEmpty(dir) ? null : Path.Combine(dir, "field-layout.txt");
 	}
 
-	private static int FieldLayoutModeForProfile(string? profile)
+	private static bool IsCyberCyanAccent(Vector4 accent)
+	{
+		return accent.X < 0.3f && accent.Y > 0.75f && accent.Z > 0.85f;
+	}
+
+	private static int FieldLayoutModeForProfile(string? profile, Vector4 accent)
 	{
 		var normalized = NormalizeWebProfile(profile);
 		if (normalized == InpaWebProfile) return 1;
 		if (normalized == PrincetonWebProfile) return 2;
-		if (normalized == GenericWebProfile) return 3;
+		if (normalized == GenericWebProfile) return IsCyberCyanAccent(accent) ? 4 : 3;
 		return 0;
 	}
 
@@ -3221,12 +3247,13 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		if (mode == 1) return "黑黄";
 		if (mode == 2) return "蓝白";
 		if (mode == 3) return "橙白";
+		if (mode == 4) return "霓虹青";
 		return "自动识别";
 	}
 
 	private static string FieldLayoutProfileText(string profile)
 	{
-		var mode = FieldLayoutModeForProfile(profile);
+		var mode = FieldLayoutModeForProfile(profile, fieldPageAccent);
 		return mode == 0 ? "等待网页连接" : (FieldLayoutName(mode) + "（" + WebProfileLabel(NormalizeWebProfile(profile)) + "）");
 	}
 
@@ -3242,6 +3269,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 			if (value == "black-yellow" || value == "1") fieldLayoutMode = 1;
 			else if (value == "blue-white" || value == "2") fieldLayoutMode = 2;
 			else if (value == "orange-white" || value == "3") fieldLayoutMode = 3;
+			else if (value == "neon-cyan" || value == "4") fieldLayoutMode = 4;
 			else fieldLayoutMode = 0;
 		}
 		catch { fieldLayoutMode = 0; }
@@ -3256,6 +3284,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 			var value = fieldLayoutMode == 1 ? "black-yellow"
 				: fieldLayoutMode == 2 ? "blue-white"
 				: fieldLayoutMode == 3 ? "orange-white"
+				: fieldLayoutMode == 4 ? "neon-cyan"
 				: "auto";
 			File.WriteAllText(file, value, new UTF8Encoding(false));
 		}
@@ -3301,6 +3330,16 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 			radius = 4f;
 			return true;
 		}
+		if (mode == 4)
+		{
+			bg = new Vector4(0.0313726f, 0.0313726f, 0.0313726f, 1f);
+			border = new Vector4(0.2313725f, 0.2392157f, 0.2705882f, 1f);
+			text = new Vector4(0.9294118f, 0.9294118f, 0.9294118f, 1f);
+			accent = new Vector4(0.1450980f, 0.9294118f, 1f, 1f);
+			focus = new Vector4(0.1450980f, 0.9294118f, 1f, 1f);
+			radius = 4f;
+			return true;
+		}
 		return false;
 	}
 
@@ -3318,7 +3357,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 
 	private static void SelectFieldLayout(int mode)
 	{
-		fieldLayoutMode = Math.Clamp(mode, 0, 3);
+		fieldLayoutMode = Math.Clamp(mode, 0, 4);
 		if (fieldLayoutMode > 0)
 		{
 			ApplyFieldLayoutPreset(fieldLayoutMode);
@@ -3406,7 +3445,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		{
 			LoadFieldAlign();
 			ImGui.TextColored(new Vector4(0.85f, 0.72f, 0.35f, 1f), "默认版式");
-			for (var mode = 0; mode <= 3; mode++)
+			for (var mode = 0; mode <= 4; mode++)
 			{
 				if (mode > 0) ImGui.SameLine();
 				if (ImGui.RadioButton(FieldLayoutName(mode) + "###fieldLayout" + mode, fieldLayoutMode == mode))
@@ -3417,7 +3456,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 				: "等待网页连接";
 			ImGui.TextWrapped("自动识别当前：" + detected +
 				(fieldLayoutMode == 0 ? "" : "；当前手动覆盖为" + FieldLayoutName(fieldLayoutMode)));
-			ImGui.TextWrapped("自动模式会按当前网页版本切换黑黄 / 蓝白 / 橙白；手动模式优先使用所选版式。");
+			ImGui.TextWrapped("自动模式会按当前网页版本及皮肤切换黑黄 / 蓝白 / 橙白 / 霓虹青；手动模式优先使用所选版式。");
 			ImGui.Separator();
 			ImGui.TextWrapped("先点一下页面里的输入框（会出现一个覆盖框），再拖下面的滑块让它和页面的框完全重合；颜色在下面调。改完点保存。");
 			ImGui.Spacing();
@@ -3935,7 +3974,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 			LoadFieldAlign();
 			Vector4 drawBg, drawBorder, drawText, drawAccent, drawFocus;
 			float drawRadius;
-			var autoLayout = FieldLayoutModeForProfile(fieldDetectedProfile);
+			var autoLayout = FieldLayoutModeForProfile(fieldDetectedProfile, fieldPageAccent);
 			if (fieldLayoutMode == 0 && autoLayout > 0 &&
 				TryGetFieldLayoutPreset(autoLayout, out drawBg, out drawBorder, out drawText,
 					out drawAccent, out drawFocus, out drawRadius))
