@@ -51,26 +51,28 @@ dotnet build -c Release
 
 产物在 `bin/Release/`：`INPABridge.dll` + `INPABridge.json` + `INPABridge.deps.json`。
 
-## 插件包结构（重要）
+## 插件包结构
 
-编译产物只是三个文件，**直接打包会缺页面**。完整的 `latest.zip` 必须是：
+`latest.zip` 内容：
 
 ```
 INPABridge.dll
 INPABridge.json
 INPABridge.deps.json
 field-theme.txt
-www/
-  └── generic/
-      └── index.html
 ```
 
 说明：
 
-- `www/{profile}/index.html` 是内嵌网页，插件从自身目录读取后提供给游戏内浏览器。
-  `profile` 取值 `generic`（通用版）/ `inpa` / `princeton`，游戏内可在插件窗口切换。
-- `field-theme.txt` 决定游戏内输入框样式。
-- 这两样都不是编译产物，由维护者在打包时放入；**本仓库只包含插件源码，不包含任何网页文件**。
+- **本插件不内置网页**，只提供本机 HTTP 服务（`127.0.0.1:18500`）与游戏内联动能力。
+- `field-theme.txt` 决定游戏内输入框配色，不是编译产物。
+- 页面由使用者自行提供，插件按以下顺序查找：
+  1. 插件目录下 `page.txt` 里写的路径
+  2. 插件目录下 `app.html`
+  3. 插件目录下 `www/{profile}/app.html`
+  4. 插件目录下 `www/{profile}/index.html`
+
+  其中 `profile` 取值 `generic` / `inpa` / `princeton`，游戏内可在插件窗口切换。
 
 ## 许可
 
