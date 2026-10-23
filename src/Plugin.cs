@@ -23,6 +23,7 @@ using System.Net.WebSockets;
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
@@ -32,7 +33,6 @@ using System.Threading.Tasks;
 using Dalamud.Game;
 using Dalamud.Game.Command;
 using Dalamud.Interface.ManagedFontAtlas;
-using Dalamud.Interface.ImGuiFileDialog;
 using Dalamud.Bindings.ImGui;
 using System.Numerics;
 using Dalamud.Game.Chat;
@@ -108,6 +108,14 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 	}
 
 	private const int Port = 18500;
+	private const string InpaWebProfile = "inpa";
+	private const string PrincetonWebProfile = "princeton";
+	private const string GenericWebProfile = "generic";
+
+	private static string? webRootInput;
+	private static string webRootHint = "";
+	private static bool webRootLoaded;
+	private static int webProfileIndex = 2;
 
 	private HttpListener? listener;
 
@@ -303,7 +311,6 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		{
 		PluginInterface.UiBuilder.Draw += DrawOverlayHook;
 		PluginInterface.UiBuilder.Draw += DrawConfigWindow;
-		PluginInterface.UiBuilder.Draw += DrawFileDialogs;
 			try { PluginInterface.UiBuilder.OpenConfigUi += OnOpenConfigUi; } catch { }
 		}
 		catch (Exception ex5)
@@ -370,7 +377,6 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		{
 		PluginInterface.UiBuilder.Draw -= DrawOverlayHook;
 		PluginInterface.UiBuilder.Draw -= DrawConfigWindow;
-		PluginInterface.UiBuilder.Draw -= DrawFileDialogs;
 			try { PluginInterface.UiBuilder.OpenConfigUi -= OnOpenConfigUi; } catch { }
 		}
 		catch
@@ -419,38 +425,47 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		HttpListenerRequest request = ctx.Request;
 		HttpListenerResponse res = ctx.Response;
 		var origin = request.Headers["Origin"] ?? "";
+		var pathNow = (request.Url?.AbsolutePath ?? "/").ToLowerInvariant();
+		var webProfile = NormalizeWebProfile(ProfileName(request));
+		if (webProfile.Length > 0) fieldDetectedProfile = webProfile;
+		var pingRoute = pathNow == "/ping";
+		var pageRoute = IsPageRoute(request.Url?.AbsolutePath ?? "/");
 		bool originOk = OriginAllowed(origin);
-		if (origin.Length > 0 && originOk) { res.Headers["Access-Control-Allow-Origin"] = origin; res.Headers["Vary"] = "Origin"; }
+		bool tokenOk = TokenOk(request, webProfile);
+		/* 页面正文里注入了本机口令，不能给跨源脚本读取权限；只允许导航打开。 */
+		/* API 即使口令错误也回 CORS 头，让网页能读到明确的 403；真正动作仍会被下面的口令校验拦住。 */
+		bool allowCrossOrigin = originOk || tokenOk || pingRoute || !pageRoute;
+		if (origin.Length > 0 && allowCrossOrigin) { res.Headers["Access-Control-Allow-Origin"] = origin; res.Headers["Vary"] = "Origin"; }
 		else if (origin.Length == 0) res.Headers["Access-Control-Allow-Origin"] = "*";   // 同源/本机程序
 		/* 允许的头列全一点：页面里的 fetch 带 cache:"no-store" 时会额外加 Cache-Control/Pragma，
 		   那会让请求变成"非简单请求"，浏览器先发 OPTIONS 预检——预检不过，真正的请求就发不出去。 */
-		res.Headers["Access-Control-Allow-Headers"] = "Content-Type, X-InPA-Token, Cache-Control, Pragma";
+		res.Headers["Access-Control-Allow-Headers"] = "Content-Type, X-InPA-Token, X-InPA-Profile, Cache-Control, Pragma";
 		res.Headers["Access-Control-Max-Age"] = "600";
 		res.Headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS";
+		/* Chromium 从公网 HTTPS 页面访问 127.0.0.1 时会先发 Private Network Access 预检。
+		   不返回这一项时，浏览器表现为直接的 Failed to fetch。 */
+		res.Headers["Access-Control-Allow-Private-Network"] = "true";
 		try
 		{
 			if (request.HttpMethod == "OPTIONS")
 			{
-				res.StatusCode = 204;
+				res.StatusCode = allowCrossOrigin || origin.Length == 0 ? 204 : 403;
 				res.Close();
 				return;
 			}
-			var pathNow = (request.Url?.AbsolutePath ?? "/").ToLowerInvariant();
-			/* 网页端已停用：不再有「网页连接口令」。现在只按来源判断 ——
-			   本机页面（游戏内窗口 / exe / 启动器，127.0.0.1 或 localhost）自动放行；
-			   其它网站、以及 file:// 页面（Origin: null）一律拒绝，免得随便一个本地网页就能调插件。 */
-			if (!originOk)
+			/* 本机页面继续免口令；托管网页必须同时声明通用档案并携带该档案的口令。 */
+			if (!pageRoute && !pingRoute && !originOk && !tokenOk)
 			{
 				res.StatusCode = 403;
 				res.ContentType = "application/json; charset=utf-8";
-				var msg = Encoding.UTF8.GetBytes("{\"ok\":false,\"error\":\"来源不允许：来自 " + origin + "\"}");
+				var msg = Encoding.UTF8.GetBytes("{\"ok\":false,\"error\":\"网页没有通过口令校验。请在插件「网页连接」页复制口令。\"}");
 				res.OutputStream.Write(msg, 0, msg.Length);
 				res.Close();
 				return;
 			}
-			if (IsPageRoute(request.Url?.AbsolutePath ?? "/"))
+			if (pageRoute)
 			{
-				await WritePageAsync(res).ConfigureAwait(continueOnCapturedContext: false);
+				await WritePageAsync(res, webProfile).ConfigureAwait(continueOnCapturedContext: false);
 				return;
 			}
 			/* WebSocket 实时推送：握手成功后这条请求就交给 HandleWsAsync，不再写普通响应 */
@@ -467,8 +482,8 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 				if (request.HttpMethod == "POST") { statePostCount++; lastStatePostAt = DateTime.Now.ToString("HH:mm:ss"); }
 				else { stateGetCount++; lastStateGetAt = DateTime.Now.ToString("HH:mm:ss"); }
 				payload = (request.HttpMethod == "POST")
-					? await HandleStatePostAsync(request).ConfigureAwait(false)
-					: HandleStateGet();
+					? await HandleStatePostAsync(request, webProfile).ConfigureAwait(false)
+					: HandleStateGet(webProfile);
 				break;
 
 			case "/field":
@@ -480,17 +495,17 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 				break;
 
 			case "/export":
-				payload = await HandleExportAsync(request).ConfigureAwait(false);
+				payload = await HandleExportAsync(request, webProfile).ConfigureAwait(false);
 				break;
 
 			case "/sessions":
 				payload = request.HttpMethod == "POST"
-					? await HandleSessionsPostAsync(request).ConfigureAwait(false)
-					: HandleSessionsGet(request);
+					? await HandleSessionsPostAsync(request, webProfile).ConfigureAwait(false)
+					: HandleSessionsGet(request, webProfile);
 				break;
 
 			case "/sessions/archive":
-				payload = await HandleSessionArchiveAsync(request).ConfigureAwait(false);
+				payload = await HandleSessionArchiveAsync(request, webProfile).ConfigureAwait(false);
 				break;
 
 			case "/sessions/file":
@@ -508,23 +523,23 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 				break;
 
 			case "/pageinfo":
-				payload = PageInfo();
+				payload = PageInfo(webProfile);
 				break;
 
 			case "/exportdir":
-				if (request.HttpMethod == "POST") payload = await HandleExportDirPostAsync(request).ConfigureAwait(false);
-				else payload = new { ok = true, dir = ReadExportDir() };
+				if (request.HttpMethod == "POST") payload = await HandleExportDirPostAsync(request, webProfile).ConfigureAwait(false);
+				else payload = new { ok = true, dir = ReadExportDir(webProfile) };
 				break;
 	
 			case "/state/stats":
-				payload = new { ok = true, get = stateGetCount, post = statePostCount, lastGet = lastStateGetAt, lastPost = lastStatePostAt, path = StateFile() };
+				payload = new { ok = true, get = stateGetCount, post = statePostCount, lastGet = lastStateGetAt, lastPost = lastStatePostAt, path = StateFile(webProfile) };
 				break;
 			case "/ping":
 				payload = new
 				{
 					ok = true,
 					name = "INPA Bridge",
-					version = "1.7.75",
+					version = "1.7.81",
 					api = 15,
 					port = 18500,
 					bound = boundPrefix
@@ -636,6 +651,38 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		return false;
 	}
 
+	private static string ProfileName(HttpListenerRequest request)
+	{
+		var name = request.QueryString["profile"];
+		if (string.IsNullOrWhiteSpace(name)) name = request.Headers["X-InPA-Profile"];
+		return (name ?? "").Trim().ToLowerInvariant();
+	}
+
+	private static string NormalizeWebProfile(string? profile)
+	{
+		var value = (profile ?? "").Trim().ToLowerInvariant();
+		if (value == InpaWebProfile) return InpaWebProfile;
+		if (value == PrincetonWebProfile) return PrincetonWebProfile;
+		if (value == GenericWebProfile) return GenericWebProfile;
+		return "";
+	}
+
+	private static string WebProfileFolderName(string profile)
+	{
+		if (profile == InpaWebProfile) return "INPA Front Desk Helper";
+		if (profile == PrincetonWebProfile) return "Princeton Front Desk Helper";
+		if (profile == GenericWebProfile) return "FF14 RP Front Desk Helper";
+		throw new InvalidOperationException("未知的网页档案");
+	}
+
+	private static string WebProfileLabel(string profile)
+	{
+		if (profile == InpaWebProfile) return "INPA";
+		if (profile == PrincetonWebProfile) return "普林斯顿";
+		if (profile == GenericWebProfile) return "通用版";
+		return "网页";
+	}
+
 	private static string PluginDirectory()
 	{
 		try
@@ -671,10 +718,54 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		return PluginDirectory();
 	}
 
+	private static string WebRootConfigFile(string profile)
+	{
+		var suffix = profile == GenericWebProfile ? "" : "-" + profile;
+		return Path.Combine(PluginDirectory(), "web-data-root" + suffix + ".txt");
+	}
+
+	private static string DefaultWebRoot(string profile)
+	{
+		var documents = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+		if (string.IsNullOrWhiteSpace(documents))
+		{
+			documents = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Documents");
+		}
+		return Path.Combine(documents, WebProfileFolderName(profile));
+	}
+
+	private static string WebDataRoot(string profile)
+	{
+		if (string.IsNullOrEmpty(profile)) throw new InvalidOperationException("缺少网页档案");
+		try
+		{
+			var file = WebRootConfigFile(profile);
+			if (File.Exists(file))
+			{
+				var configured = File.ReadAllText(file, Encoding.UTF8).Trim().Trim('"');
+				if (configured.Length > 0 && Path.IsPathRooted(configured) && RootExists(configured))
+					return Path.GetFullPath(configured);
+			}
+		}
+		catch { }
+		return DefaultWebRoot(profile);
+	}
+
+	private static string SaveWebRoot(string root, string profile)
+	{
+		var value = (root ?? "").Trim().Trim('"');
+		if (value.Length == 0 || !Path.IsPathRooted(value) || !RootExists(value))
+			throw new InvalidOperationException("请填写一个有效的绝对文件夹路径");
+		value = Path.GetFullPath(value);
+		Directory.CreateDirectory(value);
+		File.WriteAllText(WebRootConfigFile(profile), value, new UTF8Encoding(false));
+		return value;
+	}
+
 	/// <summary>页面把要导出的文件（xlsx / json）POST 过来，由插件写到磁盘——
 	/// 游戏内的 CEF 弹不出"另存为"，所以走服务端落盘，并回报真实路径。
 	/// dir 留空或不是绝对路径 → 写到"页面所在文件夹"（也就是这个店自己的文件夹）。</summary>
-	private static async Task<object> HandleExportAsync(HttpListenerRequest request)
+	private static async Task<object> HandleExportAsync(HttpListenerRequest request, string webProfile)
 	{
 		string body;
 		using (var reader = new StreamReader(request.InputStream, request.ContentEncoding ?? Encoding.UTF8))
@@ -702,7 +793,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		// 留空 / 不是绝对路径 / 那个盘都不存在（换台电脑、目录没了）→ 一律回到「程序所在的文件夹」
 		if (dir.Length == 0 || !Path.IsPathRooted(dir) || !RootExists(dir))
 		{
-			var folder = PageFolder();
+			var folder = webProfile.Length > 0 ? WebDataRoot(webProfile) : PageFolder();
 			if (string.IsNullOrEmpty(folder)) return new { ok = false, error = "找不到程序文件夹" };
 			dir = folder!;
 		}
@@ -718,10 +809,11 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 	}
 
 	/// <summary>场次归档目录：指定绝对目录优先；否则用页面旁边的 data\sessions。</summary>
-	private static string SessionDir(string? requested)
+	private static string SessionDir(string? requested, string webProfile = "")
 	{
 		var dir = (requested ?? "").Trim().Trim('"');
 		if (dir.Length > 0 && Path.IsPathRooted(dir) && RootExists(dir)) return dir;
+		if (webProfile.Length > 0) return Path.Combine(WebDataRoot(webProfile), "data", "sessions");
 		var folder = PageFolder();
 		if (string.IsNullOrEmpty(folder)) throw new InvalidOperationException("找不到程序文件夹");
 		return Path.Combine(folder!, "data", "sessions");
@@ -743,12 +835,12 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 	}
 
 	/// <summary>列出一个目录里的本程序场次归档；只认 format=INPA_SESSION 的 JSON。</summary>
-	private static object HandleSessionsGet(HttpListenerRequest request)
+	private static object HandleSessionsGet(HttpListenerRequest request, string webProfile)
 	{
-		return BuildSessionsPayload(request.QueryString["dir"]);
+		return BuildSessionsPayload(request.QueryString["dir"], webProfile);
 	}
 
-	private static async Task<object> HandleSessionsPostAsync(HttpListenerRequest request)
+	private static async Task<object> HandleSessionsPostAsync(HttpListenerRequest request, string webProfile)
 	{
 		string body;
 		using (var reader = new StreamReader(request.InputStream, request.ContentEncoding ?? Encoding.UTF8))
@@ -761,14 +853,14 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 				dir = dEl.GetString() ?? "";
 		}
 		catch { }
-		return BuildSessionsPayload(dir);
+		return BuildSessionsPayload(dir, webProfile);
 	}
 
-	private static object BuildSessionsPayload(string? requestedDir)
+	private static object BuildSessionsPayload(string? requestedDir, string webProfile)
 	{
 		try
 		{
-			var dir = SessionDir(requestedDir);
+			var dir = SessionDir(requestedDir, webProfile);
 			Directory.CreateDirectory(dir);
 			var list = new List<object>();
 			foreach (var file in Directory.GetFiles(dir, "*.json", SearchOption.TopDirectoryOnly)
@@ -846,7 +938,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 	}
 
 	/// <summary>写一对同名 JSON + XLSX；同一个 session.id 再次保存会覆盖同一对文件。</summary>
-	private static async Task<object> HandleSessionArchiveAsync(HttpListenerRequest request)
+	private static async Task<object> HandleSessionArchiveAsync(HttpListenerRequest request, string webProfile)
 	{
 		string body;
 		using (var reader = new StreamReader(request.InputStream, request.ContentEncoding ?? Encoding.UTF8))
@@ -885,7 +977,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 
 		try
 		{
-			var dir = SessionDir(dirRequested);
+			var dir = SessionDir(dirRequested, webProfile);
 			Directory.CreateDirectory(dir);
 			var existing = FindArchivedJsonById(dir, sessionId);
 			var baseName = existing != null
@@ -953,9 +1045,19 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		try
 		{
 			if (jsonPath.Length == 0 || !Path.IsPathRooted(jsonPath) ||
-				!string.Equals(Path.GetExtension(jsonPath), ".json", StringComparison.OrdinalIgnoreCase) ||
-				!File.Exists(jsonPath))
+				!string.Equals(Path.GetExtension(jsonPath), ".json", StringComparison.OrdinalIgnoreCase))
 				return new { ok = false, error = "场次文件不存在" };
+
+			var dir = Path.GetDirectoryName(jsonPath);
+			if (string.IsNullOrEmpty(dir)) return new { ok = false, error = "场次目录无效" };
+			var baseName = Path.GetFileNameWithoutExtension(jsonPath);
+			var xlsxPath = Path.Combine(dir!, baseName + ".xlsx");
+			if (!File.Exists(jsonPath))
+			{
+				bool removedOrphan = false;
+				if (File.Exists(xlsxPath)) { File.Delete(xlsxPath); removedOrphan = true; }
+				return new { ok = true, missing = true, jsonPath, xlsxPath, xlsxDeleted = removedOrphan };
+			}
 
 			using (var doc = JsonDocument.Parse(ReadStateText(jsonPath)))
 			{
@@ -963,11 +1065,6 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 					!string.Equals(fmt.GetString(), "INPA_SESSION", StringComparison.Ordinal))
 					return new { ok = false, error = "拒绝删除：不是 INPA_SESSION 场次文件" };
 			}
-
-			var dir = Path.GetDirectoryName(jsonPath);
-			if (string.IsNullOrEmpty(dir)) return new { ok = false, error = "场次目录无效" };
-			var baseName = Path.GetFileNameWithoutExtension(jsonPath);
-			var xlsxPath = Path.Combine(dir!, baseName + ".xlsx");
 
 			/* Excel 先删；JSON 是归档完成标记，最后删。任何一步失败都会保留仍可定位的 JSON。 */
 			bool xlsxDeleted = false;
@@ -1055,6 +1152,56 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		return null;
 	}
 
+	private static string? ResolvePagePathForProfile(string webProfile)
+	{
+		if (string.IsNullOrEmpty(webProfile)) return ResolvePagePath();
+		var expectedVariant = webProfile == InpaWebProfile ? "main"
+			: webProfile == PrincetonWebProfile ? "princeton"
+			: "generic";
+		var candidates = new List<string>();
+		void Add(string? path)
+		{
+			if (string.IsNullOrWhiteSpace(path)) return;
+			if (!candidates.Contains(path, StringComparer.OrdinalIgnoreCase)) candidates.Add(path);
+		}
+
+		var current = ResolvePagePath();
+		Add(current);
+		var pluginDir = PluginDirectory();
+		Add(Path.Combine(pluginDir, "app.html"));
+		Add(Path.Combine(pluginDir, "www", webProfile, "app.html"));
+		Add(Path.Combine(pluginDir, "www", webProfile, "index.html"));
+		try
+		{
+			var currentFolder = string.IsNullOrEmpty(current) ? null : Path.GetDirectoryName(current);
+			var parent = string.IsNullOrEmpty(currentFolder) ? null : Path.GetDirectoryName(currentFolder);
+			if (!string.IsNullOrEmpty(parent) && Directory.Exists(parent))
+			{
+				foreach (var dir in Directory.GetDirectories(parent))
+				{
+					Add(Path.Combine(dir, "app.html"));
+					Add(Path.Combine(dir, "上传用", "index.html"));
+				}
+			}
+		}
+		catch { }
+
+		foreach (var candidate in candidates)
+		{
+			try
+			{
+				if (!File.Exists(candidate)) continue;
+				var html = File.ReadAllText(candidate, Encoding.UTF8);
+				if (Regex.IsMatch(html,
+					"<html[^>]*data-fd-variant\\s*=\\s*\"" + Regex.Escape(expectedVariant) + "\"",
+					RegexOptions.IgnoreCase))
+					return candidate;
+			}
+			catch { }
+		}
+		return null;
+	}
+
 	private static string NotFoundHtml()
 	{
 		string text = PluginDirectory();
@@ -1063,9 +1210,9 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		return "<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\"><title>INPA 前台帮手 · 未找到页面</title></head><body style=\"background:#1a1420;color:#e8e0f0;font:14px/1.9 'Microsoft YaHei',sans-serif;padding:40px\"><h2 style=\"color:#e0b563\">没有找到 app.html</h2><p>把 <b>app.html</b> 放到下面这个目录，然后刷新本页：</p><pre style=\"background:#241d2b;padding:12px;border-radius:8px;white-space:pre-wrap\">" + text2 + "</pre><p>或者建一个 <b>page.txt</b>（就在同一目录），里面只写一行：app.html 的完整路径。</p><pre style=\"background:#241d2b;padding:12px;border-radius:8px;white-space:pre-wrap\">" + text3 + "</pre><p style=\"color:#9a8fb0\">路径示例：D:\\你放这个文件夹的位置\\app.html</p></body></html>";
 	}
 
-	private async Task WritePageAsync(HttpListenerResponse res)
+	private async Task WritePageAsync(HttpListenerResponse res, string webProfile)
 	{
-		string path = ResolvePagePath();
+		string? path = ResolvePagePathForProfile(webProfile);
 		byte[] array;
 		if (path == null)
 		{
@@ -1087,7 +1234,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 			try
 			{
 				array = await File.ReadAllBytesAsync(path).ConfigureAwait(continueOnCapturedContext: false);
-				array = InjectPageStamp(array, path);
+				array = InjectPageStamp(array, path, webProfile);
 			}
 			catch (Exception ex)
 			{
@@ -1106,14 +1253,14 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 	/// <summary>给发出去的页面注入一个「页面版本戳」（就是 app.html 的修改时间）。
 	/// 页面把它和 /pageinfo 返回的当前戳一比：不一样 = 浏览器手里那份是旧的 → 提示刷新。
 	/// 这样改了 app.html 之后，开着的旧窗口自己会说话，不用猜为什么点了没反应。</summary>
-	private static byte[] InjectPageStamp(byte[] bytes, string path)
+	private static byte[] InjectPageStamp(byte[] bytes, string path, string webProfile)
 	{
 		try
 		{
 			string stamp = File.GetLastWriteTimeUtc(path).Ticks.ToString(CultureInfo.InvariantCulture);
 			/* 顺便把访问口令注入页面：本机模式（游戏内窗口 / 启动器发的页面）用起来无感，
 			   页面会自动把它带在每个请求上。 */
-			string inject = "<script>window.__INPA_PAGE_STAMP=\"" + stamp + "\";window.__INPA_TOKEN=\"" + AccessToken() + "\";</script>";
+			string inject = "<script>window.__INPA_PAGE_STAMP=\"" + stamp + "\";window.__INPA_TOKEN=\"" + AccessToken(webProfile) + "\";</script>";
 			string html = Encoding.UTF8.GetString(bytes);
 			/* 必须插在页面自己的脚本之前 —— 页面是"一加载就读口令"，插到 </body> 前就太晚了。 */
 			int at = html.IndexOf("<head>", StringComparison.OrdinalIgnoreCase);
@@ -1131,37 +1278,41 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 	// ---------------------------------------------------------------- 导出目录（本机设置，不进同步数据）
 	// 以前存在共用业务数据里，两个窗口一同步/一冲突重载就可能被覆盖成空。
 	// 现在单独存成「页面所在文件夹」里的 exportdir.txt —— 跟店走、不参与同步。
-	private static string ExportDirFile()
+	private static string ExportDirFile(string webProfile = "")
 	{
+		if (webProfile.Length > 0) return Path.Combine(WebDataRoot(webProfile), "exportdir.txt");
 		var folder = PageFolder();
 		if (string.IsNullOrEmpty(folder)) folder = PluginDirectory();
 		return Path.Combine(folder!, "exportdir.txt");
 	}
 
-	private static string ReadExportDir()
+	private static string ReadExportDir(string webProfile = "")
 	{
 		try
 		{
-			var f = ExportDirFile();
+			var f = ExportDirFile(webProfile);
 			if (File.Exists(f)) return File.ReadAllText(f, Encoding.UTF8).Trim();
 		}
 		catch { }
 		return "";
 	}
 
-	private static object WriteExportDir(string dir)
+	private static object WriteExportDir(string dir, string webProfile = "")
 	{
 		try
 		{
 			dir = (dir ?? "").Trim().Trim('"');
-			File.WriteAllText(ExportDirFile(), dir, new UTF8Encoding(false));
+			var file = ExportDirFile(webProfile);
+			var parent = Path.GetDirectoryName(file);
+			if (!string.IsNullOrEmpty(parent)) Directory.CreateDirectory(parent);
+			File.WriteAllText(file, dir, new UTF8Encoding(false));
 			Log.Information("INPA Bridge: 导出目录已设为 [{0}]", new object[] { dir });
 			return new { ok = true, dir };
 		}
 		catch (Exception e) { return new { ok = false, error = e.Message }; }
 	}
 
-	private static async Task<object> HandleExportDirPostAsync(HttpListenerRequest request)
+	private static async Task<object> HandleExportDirPostAsync(HttpListenerRequest request, string webProfile)
 	{
 		string body;
 		using (var reader = new StreamReader(request.InputStream, request.ContentEncoding ?? Encoding.UTF8))
@@ -1173,20 +1324,35 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 			if (doc.RootElement.TryGetProperty("dir", out var dEl) && dEl.ValueKind == JsonValueKind.String) dir = dEl.GetString() ?? "";
 		}
 		catch { }
-		return WriteExportDir(dir);
+		return WriteExportDir(dir, webProfile);
 	}
 
 	/// <summary>当前页面的版本信息（给页面判断自己是不是旧的）。</summary>
-	private static object PageInfo()
+	private static object PageInfo(string webProfile)
 	{
 		string p = "", stamp = "";
 		try
 		{
-			p = ResolvePagePath() ?? "";
+			p = ResolvePagePathForProfile(webProfile) ?? "";
 			if (p.Length > 0 && File.Exists(p))
 				stamp = File.GetLastWriteTimeUtc(p).Ticks.ToString(CultureInfo.InvariantCulture);
 		}
 		catch { }
+		if (webProfile.Length > 0)
+		{
+			var dataRoot = Path.Combine(WebDataRoot(webProfile), "data");
+			return new
+			{
+				ok = true,
+				stamp,
+				path = p,
+				profile = webProfile,
+				profileLabel = WebProfileLabel(webProfile),
+				dataRoot,
+				sessionDir = Path.Combine(dataRoot, "sessions"),
+				statePath = Path.Combine(dataRoot, "inpa-data.json")
+			};
+		}
 		return new { ok = true, stamp, path = p };
 	}
 
@@ -2860,10 +3026,10 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		}
 	}
 	
-	private static int cfgTab;           // 0=命令 1=切换页面 2=输入框设置
+	private static int cfgTab;           // 0=命令 1=输入框设置 2=网页连接
 	private static int cfgWantTab = -1;  // 打开设置时想直接跳到哪一页（下一帧生效）
 
-	/// <summary>打开设置窗口并直接切到某一页（0 命令 / 1 切换页面 / 2 输入框设置）。</summary>
+	/// <summary>打开设置窗口并直接切到某一页（0 命令 / 1 输入框设置 / 2 网页连接）。</summary>
 	private static void OpenConfigTab(int tab) { cfgOpen = true; cfgWantTab = tab; }
 
 	private static void DrawConfigWindow()
@@ -2889,23 +3055,22 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 						DrawCmdTab();
 						ImGui.EndTabItem();
 					}
-					if (ImGui.BeginTabItem("切换页面", (want == 1) ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None))
+					if (ImGui.BeginTabItem("输入框设置", (want == 1) ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None))
 					{
 						cfgTab = 1;
-						if (pageInput.Length == 0) pageInput = CurrentPagePath() ?? "";
-						DrawPageTab();
+						DrawCalTab();
 						ImGui.EndTabItem();
 					}
-					if (ImGui.BeginTabItem("输入框设置", (want == 2) ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None))
+					if (ImGui.BeginTabItem("网页连接", (want == 2) ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None))
 					{
 						cfgTab = 2;
-						DrawCalTab();
+						DrawWebTab();
 						ImGui.EndTabItem();
 					}
 					ImGui.EndTabBar();
 				}
 			}
-			calOpen = open && (cfgTab == 2);   // 只有「输入框设置」页真的开着时，覆盖层才不抢焦点 / 不自动关闭
+			calOpen = open && (cfgTab == 1);   // 只有「输入框设置」页真的开着时，覆盖层才不抢焦点 / 不自动关闭
 			ImGui.End();
 		}
 		catch (Exception e) { Log.Debug(e, "INPA: 设置窗口绘制失败"); }
@@ -2919,180 +3084,105 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		ImGui.Text("/inpa lock           切换窗口位置锁定（锁定后页面里才能拖动、选字）");
 		ImGui.Text("/inpa reload         刷新网页");
 		ImGui.Text("/inpa cal            打开本窗口的「输入框设置」页");
-		ImGui.Text("/inpa page           打开本窗口的「切换页面」页");
 		ImGui.Separator();
 		ImGui.Text("桥接地址：http://127.0.0.1:18500/app");
 	}
 
-	// ---------------------------------------------------------------- 页面切换（在游戏内换店）
-	// 游戏内窗口显示哪个店，取决于 devPlugins\INPABridge\page.txt 指向哪个 app.html。
-	// 这里提供一个小窗口：自动列出"当前页面同级文件夹里的其它 app.html"，点一下即切换；
-	// 也可以手动填一个完整路径。
-	private static string pageInput = "";
-	private static string pageHint = "";
-	private static readonly FileDialogManager fileDialogs = new FileDialogManager();
 
-	private static void DrawFileDialogs()
+	private static void DrawWebTab()
 	{
-		try { fileDialogs.Draw(); } catch (Exception e) { Log.Debug(e, "INPA: 文件选择框绘制失败"); }
-	}
-
-	// 「最近用过」的页面：记在 pagehistory.txt（每行一个路径，最近的在最前）。
-	// 这样店铺文件夹挪到别的盘之后，仍然一键就能切回去，不再依赖"跟当前页面同级"。
-	private static string PageHistoryFile() { return Path.Combine(PluginDirectory(), "pagehistory.txt"); }
-
-	private static List<string> ReadPageHistory()
-	{
-		var list = new List<string>();
 		try
 		{
-			var f = PageHistoryFile();
-			if (File.Exists(f))
+			var profiles = new string[3] { InpaWebProfile, PrincetonWebProfile, GenericWebProfile };
+			ImGui.TextColored(new Vector4(0.85f, 0.72f, 0.35f, 1f), "三版网页 · 本机档案");
+			ImGui.TextWrapped("托管网页通过本插件保存数据、读取历史，并使用游戏联动。三版各有独立目录和独立口令。");
+			ImGui.Text("选择网页档案：");
+			for (int i = 0; i < profiles.Length; i++)
 			{
-				foreach (var line in File.ReadAllLines(f, Encoding.UTF8))
+				if (i > 0) ImGui.SameLine();
+				if (ImGui.RadioButton(WebProfileLabel(profiles[i]) + "###webProfile" + i, webProfileIndex == i))
 				{
-					var p = (line ?? "").Trim();
-					if (p.Length > 0 && File.Exists(p)) list.Add(p);
+					webProfileIndex = i;
+					webRootLoaded = false;
+					webRootHint = "";
 				}
 			}
-		}
-		catch { }
-		return list;
-	}
-
-	private static void PushPageHistory(string path)
-	{
-		try
-		{
-			if (string.IsNullOrWhiteSpace(path)) return;
-			var list = ReadPageHistory();
-			list.RemoveAll(delegate (string x) { return string.Equals(x, path, StringComparison.OrdinalIgnoreCase); });
-			list.Insert(0, path);
-			if (list.Count > 12) list.RemoveRange(12, list.Count - 12);
-			File.WriteAllLines(PageHistoryFile(), list.ToArray(), new UTF8Encoding(false));
-		}
-		catch { }
-	}
-
-	private static bool IsSamePath(string a, string? b)
-	{
-		try { return b != null && string.Equals(Path.GetFullPath(a), Path.GetFullPath(b), StringComparison.OrdinalIgnoreCase); }
-		catch { return false; }
-	}
-
-	private static string FolderLabel(string path)
-	{
-		try { return Path.GetFileName(Path.GetDirectoryName(path) ?? path); } catch { return path; }
-	}
-
-	private static void OpenPagePicker()
-	{
-		string start = "";
-		try
-		{
-			var cur = CurrentPagePath();
-			if (cur != null) start = Path.GetDirectoryName(cur) ?? "";
-		}
-		catch { }
-		try
-		{
-			/* 用"选文件"（不是"选文件夹"）：直接挑 app.html，看得见。
-			   过滤器只留 .html —— 列表里就只会有 app.html 一个，不会满屏快捷方式。 */
-			fileDialogs.OpenFileDialog("选择该店铺的 app.html", "app.html{.html}", new Action<bool, List<string>>(delegate (bool ok, List<string> files)
-			{
-				if (!ok || files == null || files.Count == 0) return;
-				var f = files[0];
-				string ext = "";
-				try { ext = Path.GetExtension(f) ?? ""; } catch { }
-				if (!string.Equals(ext, ".html", StringComparison.OrdinalIgnoreCase))
-				{
-					pageHint = "要选那个文件夹里的 app.html（你选的是 " + Path.GetFileName(f) + "）";
-					return;
-				}
-				pageInput = f;
-				SetPagePath(f);
-			}), 1, string.IsNullOrEmpty(start) ? null : start);
-		}
-		catch (Exception e) { pageHint = "打开选择框失败：" + e.Message; }
-	}
-
-	private static string? CurrentPagePath()
-	{
-		try { return ResolvePagePath(); } catch { return null; }
-	}
-
-	/// <summary>把 page.txt 改写为指定页面，并让页面重算数据文件位置、通知 Browsingway 刷新。</summary>
-	private static void SetPagePath(string path)
-	{
-		try
-		{
-			path = (path ?? "").Trim().Trim('"');
-			if (path.Length == 0) { pageHint = "请先填写 app.html 的完整路径"; return; }
-			if (Directory.Exists(path)) path = Path.Combine(path, "app.html");
-			if (!File.Exists(path)) { pageHint = "找不到这个文件：" + path; return; }
-			var pageTxt = Path.Combine(PluginDirectory(), "page.txt");
-			File.WriteAllText(pageTxt, path, new UTF8Encoding(false));
-			lock (StateLock) { statePathCache = null; }   // 数据文件位置跟着页面走，必须重算，否则会串店
-			pageInput = path;
-			pageHint = "已切换 → " + path;
-			PushPageHistory(path);
-			Log.Information("INPA Bridge: page.txt 已改为 {0}", new object[] { path });
-			ResetTells("切换页面");   // 换店铺：上一个店的密聊不算这一家的工单
-			BwOverlay("reload");
-			ChatGui.Print("INPA：已切换页面 → " + path);
-		}
-		catch (Exception e) { pageHint = "切换失败：" + e.Message; }
-	}
-
-	private static void OnInpaPageCommand()
-	{
-		pageInput = CurrentPagePath() ?? "";
-		pageHint = "";
-		OpenConfigTab(1);
-		ChatGui.Print("INPA：已打开「切换页面」（点一个店铺，或手填 app.html 路径）");
-	}
-
-	private static void DrawPageTab()
-	{
-		try
-		{
-			ImGui.TextColored(new Vector4(0.85f, 0.72f, 0.35f, 1f), "游戏内窗口显示哪个店的页面");
+			var profile = profiles[Math.Clamp(webProfileIndex, 0, profiles.Length - 1)];
 			ImGui.Separator();
-			var cur = CurrentPagePath();
-			ImGui.TextWrapped("当前：" + (cur ?? "(没找到 app.html)"));
-			ImGui.Spacing();
-
-			var hist = ReadPageHistory();
-			ImGui.Text("最近用过（点一下即切换）：");
-			if (hist.Count == 0) ImGui.TextDisabled("（还没有记录）");
-			foreach (var p in hist)
+			if (!webRootLoaded)
 			{
-				bool isCur = IsSamePath(p, cur);
-				var label = (isCur ? "● " : "○ ") + FolderLabel(p) + "###hist_" + p;
-				if (ImGui.Selectable(label, isCur)) SetPagePath(p);
+				webRootLoaded = true;
+				webRootInput = WebDataRoot(profile);
 			}
+			ImGui.Text(WebProfileLabel(profile) + "网页数据目录：");
+			ImGui.SetNextItemWidth(-260f);
+			ImGui.InputText("###inpaWebRoot" + profile, ref webRootInput, 1024);
+			ImGui.SameLine();
+			if (ImGui.Button("应用目录", new Vector2(105f, 0f)))
+			{
+				try
+				{
+					webRootInput = SaveWebRoot(webRootInput, profile);
+					tokenCache = null;
+					webRootHint = "已保存：" + webRootInput;
+				}
+				catch (Exception e) { webRootHint = "保存失败：" + e.Message; }
+			}
+			ImGui.SameLine();
+			if (ImGui.Button("恢复默认", new Vector2(105f, 0f)))
+			{
+				try
+				{
+					var configFile = WebRootConfigFile(profile);
+					if (File.Exists(configFile)) File.Delete(configFile);
+					tokenCache = null;
+					webRootInput = DefaultWebRoot(profile);
+					webRootHint = "已恢复默认目录：" + webRootInput;
+				}
+				catch (Exception e) { webRootHint = "恢复失败：" + e.Message; }
+			}
+			if (!string.IsNullOrEmpty(webRootHint)) ImGui.TextWrapped(webRootHint);
+
+			var dataRoot = Path.Combine(WebDataRoot(profile), "data");
+			ImGui.TextWrapped("数据文件：" + Path.Combine(dataRoot, "inpa-data.json"));
+			ImGui.TextWrapped("默认存档：" + Path.Combine(dataRoot, "sessions"));
 
 			ImGui.Spacing();
 			ImGui.Separator();
-			ImGui.Text("手动填写 app.html 的完整路径：");
-			ImGui.SetNextItemWidth(-300f);
-			ImGui.InputText("###inpaPageInput", ref pageInput, 512);
+			var token = AccessToken(profile);
+			ImGui.Text(WebProfileLabel(profile) + "网页连接口令：");
+			ImGui.SetNextItemWidth(-140f);
+			ImGui.InputText("###inpaWebToken" + profile, ref token, 128, ImGuiInputTextFlags.ReadOnly);
 			ImGui.SameLine();
-			if (ImGui.Button("选择 app.html…", new Vector2(140f, 0f))) OpenPagePicker();
-			ImGui.SameLine();
-			if (ImGui.Button("切换", new Vector2(80f, 0f))) SetPagePath(pageInput);
-			if (!string.IsNullOrEmpty(pageHint)) ImGui.TextWrapped(pageHint);
-
+			if (ImGui.Button("复制口令", new Vector2(120f, 0f)))
+			{
+				try { ImGui.SetClipboardText(AccessToken(profile)); webRootHint = "网页连接口令已复制"; }
+				catch (Exception e) { webRootHint = "复制失败：" + e.Message; }
+			}
+			ImGui.TextWrapped("把插件地址 http://127.0.0.1:18500 和当前档案的口令填进对应网页的「连接本机插件」面板。");
 		}
-		catch (Exception e) { Log.Debug(e, "INPA: 页面切换窗口绘制失败"); }
+		catch (Exception e) { Log.Debug(e, "INPA: 网页连接设置绘制失败"); }
 	}
 
 		// ---- 输入框覆盖层对齐参数（CSS 像素与游戏 UI 像素比例未知，标定一次即可） ----
-	private static float fieldScale = 1f, fieldDx, fieldDy, fieldRadius = 8f, fieldFontScale = 1f;
-	/* 覆盖层配色（RGBA 0..1）。默认和页面 CSS 一致：深底 #171219 / 边框 #3A2F47 / 字 #f2ecf7 */
-	private static Vector4 fieldBg = new Vector4(0.090f, 0.071f, 0.098f, 1f);
-	private static Vector4 fieldBorder = new Vector4(0.227f, 0.184f, 0.278f, 1f);
-	private static Vector4 fieldText = new Vector4(0.949f, 0.925f, 0.969f, 1f);
+	private static float fieldScale = 1f, fieldDx, fieldDy, fieldRadius = 4f, fieldFontScale = 1f;
+	/* 覆盖层配色（RGBA 0..1）。默认和 INPA 页面 CSS 一致。 */
+	private static Vector4 fieldBg = new Vector4(0.031f, 0.031f, 0.031f, 1f);
+	private static Vector4 fieldBorder = new Vector4(0.231f, 0.239f, 0.271f, 1f);
+	private static Vector4 fieldText = new Vector4(0.929f, 0.929f, 0.929f, 1f);
+	private static Vector4 fieldAccent = new Vector4(1f, 0.98f, 0f, 1f);
+	private static Vector4 fieldFocus = new Vector4(1f, 0.98f, 0f, 1f);
+	private static bool fieldPageTheme;
+	private static Vector4 fieldPageBg = new Vector4(0.031f, 0.031f, 0.031f, 1f);
+	private static Vector4 fieldPageBorder = new Vector4(0.231f, 0.239f, 0.271f, 1f);
+	private static Vector4 fieldPageText = new Vector4(0.929f, 0.929f, 0.929f, 1f);
+	private static Vector4 fieldPageAccent = new Vector4(1f, 0.98f, 0f, 1f);
+	private static Vector4 fieldPageFocus = new Vector4(1f, 0.98f, 0f, 1f);
+	private static float fieldPageRadius = 4f;
+	private static bool fieldFontWarm;
+	private static int fieldLayoutMode;                 // 0=自动识别，1=黑黄，2=蓝白，3=橙白
+	private static string fieldDetectedProfile = "";
+	private static bool fieldLayoutLoaded;
 	private static string fieldPh = "";
 	private static bool calOpen;
 	private static bool alignLoaded;
@@ -3110,14 +3200,141 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		var dir = PluginDirectory();
 		return string.IsNullOrEmpty(dir) ? null : Path.Combine(dir, "field-theme.txt");
 	}
+
+	private static string? FieldLayoutFile()
+	{
+		var dir = PluginDirectory();
+		return string.IsNullOrEmpty(dir) ? null : Path.Combine(dir, "field-layout.txt");
+	}
+
+	private static int FieldLayoutModeForProfile(string? profile)
+	{
+		var normalized = NormalizeWebProfile(profile);
+		if (normalized == InpaWebProfile) return 1;
+		if (normalized == PrincetonWebProfile) return 2;
+		if (normalized == GenericWebProfile) return 3;
+		return 0;
+	}
+
+	private static string FieldLayoutName(int mode)
+	{
+		if (mode == 1) return "黑黄";
+		if (mode == 2) return "蓝白";
+		if (mode == 3) return "橙白";
+		return "自动识别";
+	}
+
+	private static string FieldLayoutProfileText(string profile)
+	{
+		var mode = FieldLayoutModeForProfile(profile);
+		return mode == 0 ? "等待网页连接" : (FieldLayoutName(mode) + "（" + WebProfileLabel(NormalizeWebProfile(profile)) + "）");
+	}
+
+	private static void LoadFieldLayoutMode()
+	{
+		if (fieldLayoutLoaded) return;
+		fieldLayoutLoaded = true;
+		try
+		{
+			var file = FieldLayoutFile();
+			if (file == null || !File.Exists(file)) return;
+			var value = File.ReadAllText(file, Encoding.UTF8).Trim().ToLowerInvariant();
+			if (value == "black-yellow" || value == "1") fieldLayoutMode = 1;
+			else if (value == "blue-white" || value == "2") fieldLayoutMode = 2;
+			else if (value == "orange-white" || value == "3") fieldLayoutMode = 3;
+			else fieldLayoutMode = 0;
+		}
+		catch { fieldLayoutMode = 0; }
+	}
+
+	private static void SaveFieldLayoutMode()
+	{
+		try
+		{
+			var file = FieldLayoutFile();
+			if (file == null) return;
+			var value = fieldLayoutMode == 1 ? "black-yellow"
+				: fieldLayoutMode == 2 ? "blue-white"
+				: fieldLayoutMode == 3 ? "orange-white"
+				: "auto";
+			File.WriteAllText(file, value, new UTF8Encoding(false));
+		}
+		catch (Exception e) { Log.Warning(e, "INPA: 保存输入框默认版式失败"); }
+	}
+
+	private static bool TryGetFieldLayoutPreset(int mode, out Vector4 bg, out Vector4 border, out Vector4 text,
+		out Vector4 accent, out Vector4 focus, out float radius)
+	{
+		bg = fieldBg;
+		border = fieldBorder;
+		text = fieldText;
+		accent = fieldAccent;
+		focus = fieldFocus;
+		radius = fieldRadius;
+		if (mode == 1)
+		{
+			bg = new Vector4(0.0313726f, 0.0313726f, 0.0313726f, 1f);
+			border = new Vector4(0.2313725f, 0.2392157f, 0.2705882f, 1f);
+			text = new Vector4(0.9294118f, 0.9294118f, 0.9294118f, 1f);
+			accent = new Vector4(1f, 0.9803922f, 0f, 1f);
+			focus = new Vector4(1f, 0.9803922f, 0f, 1f);
+			radius = 4f;
+			return true;
+		}
+		if (mode == 2)
+		{
+			bg = new Vector4(0.9686275f, 0.9843137f, 0.9921569f, 1f);
+			border = new Vector4(0.827451f, 0.854902f, 0.87451f, 1f);
+			text = new Vector4(0.0823529f, 0.0980392f, 0.1098039f, 1f);
+			accent = new Vector4(0.4901961f, 0.9019608f, 1f, 1f);
+			focus = new Vector4(0.1843137f, 0.7372549f, 0.8509804f, 1f);
+			radius = 4f;
+			return true;
+		}
+		if (mode == 3)
+		{
+			bg = new Vector4(1f, 0.9803922f, 0.9411765f, 1f);
+			border = new Vector4(0.8627451f, 0.8470588f, 0.8f, 1f);
+			text = new Vector4(0.1098039f, 0.0941176f, 0.0705882f, 1f);
+			accent = new Vector4(1f, 0.7019608f, 0.1215686f, 1f);
+			focus = new Vector4(0.7882353f, 0.5176471f, 0f, 1f);
+			radius = 4f;
+			return true;
+		}
+		return false;
+	}
+
+	private static void ApplyFieldLayoutPreset(int mode)
+	{
+		if (!TryGetFieldLayoutPreset(mode, out var bg, out var border, out var text,
+			out var accent, out var focus, out var radius)) return;
+		fieldBg = bg;
+		fieldBorder = border;
+		fieldText = text;
+		fieldAccent = accent;
+		fieldFocus = focus;
+		fieldRadius = radius;
+	}
+
+	private static void SelectFieldLayout(int mode)
+	{
+		fieldLayoutMode = Math.Clamp(mode, 0, 3);
+		if (fieldLayoutMode > 0)
+		{
+			ApplyFieldLayoutPreset(fieldLayoutMode);
+			SaveFieldAlign();
+		}
+		SaveFieldLayoutMode();
+	}
 	
 	private static void LoadFieldAlign()
 	{
 		if (alignLoaded) return;
 		alignLoaded = true;
+		LoadFieldLayoutMode();
 		try
 		{
-			bool hasBg = false, hasBorder = false, hasText = false;
+			bool hasBg = false, hasBorder = false, hasText = false, hasAccent = false, hasFocus = false;
 			var p = FieldAlignFile();
 			if (p != null && File.Exists(p))
 			{
@@ -3129,6 +3346,8 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 					if (k == "bg") { fieldBg = ParseColor(kv[1], fieldBg); hasBg = true; continue; }
 					if (k == "border") { fieldBorder = ParseColor(kv[1], fieldBorder); hasBorder = true; continue; }
 					if (k == "text") { fieldText = ParseColor(kv[1], fieldText); hasText = true; continue; }
+					if (k == "accent") { fieldAccent = ParseColor(kv[1], fieldAccent); hasAccent = true; continue; }
+					if (k == "focus") { fieldFocus = ParseColor(kv[1], fieldFocus); hasFocus = true; continue; }
 					if (!float.TryParse(kv[1].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var f)) continue;
 					if (k == "scale") fieldScale = Math.Clamp(f, 0.4f, 3f);
 					else if (k == "dx") fieldDx = Math.Clamp(f, -400f, 400f);
@@ -3150,7 +3369,11 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 					var k = kv[0].Trim();
 					if (k == "bg" && !hasBg) { fieldBg = ParseColor(kv[1], fieldBg); continue; }
 					if (k == "border" && !hasBorder) { fieldBorder = ParseColor(kv[1], fieldBorder); continue; }
-					if (k == "text" && !hasText) { fieldText = ParseColor(kv[1], fieldText); }
+					if (k == "text" && !hasText) { fieldText = ParseColor(kv[1], fieldText); continue; }
+					if (k == "accent" && !hasAccent) { fieldAccent = ParseColor(kv[1], fieldAccent); continue; }
+					if (k == "focus" && !hasFocus) { fieldFocus = ParseColor(kv[1], fieldFocus); continue; }
+					if (k == "radius" && float.TryParse(kv[1].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var r))
+						fieldRadius = Math.Clamp(r, 0f, 24f);
 				}
 			}
 		}
@@ -3170,7 +3393,9 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 				+ Environment.NewLine + "fontsize=" + fieldFontScale.ToString("0.##", CultureInfo.InvariantCulture)
 				+ Environment.NewLine + "bg=" + FmtColor(fieldBg)
 				+ Environment.NewLine + "border=" + FmtColor(fieldBorder)
-				+ Environment.NewLine + "text=" + FmtColor(fieldText), new UTF8Encoding(false));
+				+ Environment.NewLine + "text=" + FmtColor(fieldText)
+				+ Environment.NewLine + "accent=" + FmtColor(fieldAccent)
+				+ Environment.NewLine + "focus=" + FmtColor(fieldFocus), new UTF8Encoding(false));
 		}
 		catch (Exception e) { Log.Warning(e, "INPA: 保存对齐参数失败"); }
 	}
@@ -3179,6 +3404,21 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 	{
 		try
 		{
+			LoadFieldAlign();
+			ImGui.TextColored(new Vector4(0.85f, 0.72f, 0.35f, 1f), "默认版式");
+			for (var mode = 0; mode <= 3; mode++)
+			{
+				if (mode > 0) ImGui.SameLine();
+				if (ImGui.RadioButton(FieldLayoutName(mode) + "###fieldLayout" + mode, fieldLayoutMode == mode))
+					SelectFieldLayout(mode);
+			}
+			var detected = fieldDetectedProfile.Length > 0
+				? FieldLayoutProfileText(fieldDetectedProfile)
+				: "等待网页连接";
+			ImGui.TextWrapped("自动识别当前：" + detected +
+				(fieldLayoutMode == 0 ? "" : "；当前手动覆盖为" + FieldLayoutName(fieldLayoutMode)));
+			ImGui.TextWrapped("自动模式会按当前网页版本切换黑黄 / 蓝白 / 橙白；手动模式优先使用所选版式。");
+			ImGui.Separator();
 			ImGui.TextWrapped("先点一下页面里的输入框（会出现一个覆盖框），再拖下面的滑块让它和页面的框完全重合；颜色在下面调。改完点保存。");
 			ImGui.Spacing();
 			ImGui.SetNextItemWidth(300f);
@@ -3199,15 +3439,21 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 			ImGui.ColorEdit4("边框色", ref fieldBorder, ImGuiColorEditFlags.AlphaBar | ImGuiColorEditFlags.AlphaPreviewHalf);
 			ImGui.SetNextItemWidth(300f);
 			ImGui.ColorEdit4("文字色", ref fieldText, ImGuiColorEditFlags.AlphaBar | ImGuiColorEditFlags.AlphaPreviewHalf);
+			ImGui.SetNextItemWidth(300f);
+			ImGui.ColorEdit4("信号导轨色", ref fieldAccent, ImGuiColorEditFlags.AlphaBar | ImGuiColorEditFlags.AlphaPreviewHalf);
+			ImGui.SetNextItemWidth(300f);
+			ImGui.ColorEdit4("聚焦边框色", ref fieldFocus, ImGuiColorEditFlags.AlphaBar | ImGuiColorEditFlags.AlphaPreviewHalf);
 			ImGui.Spacing();
 			if (ImGui.Button("保存", new Vector2(90f, 0f))) { SaveFieldAlign(); ChatGui.Print("INPA：输入框设置已保存"); }
 			ImGui.SameLine();
 			if (ImGui.Button("重置", new Vector2(90f, 0f)))
 			{
-				fieldScale = 1f; fieldDx = 0f; fieldDy = 0f; fieldRadius = 8f; fieldFontScale = 1f;
-				fieldBg = new Vector4(0.090f, 0.071f, 0.098f, 1f);
-				fieldBorder = new Vector4(0.227f, 0.184f, 0.278f, 1f);
-				fieldText = new Vector4(0.949f, 0.925f, 0.969f, 1f);
+				fieldScale = 1f; fieldDx = 0f; fieldDy = 0f; fieldRadius = 4f; fieldFontScale = 1f;
+				fieldBg = new Vector4(0.031f, 0.031f, 0.031f, 1f);
+				fieldBorder = new Vector4(0.231f, 0.239f, 0.271f, 1f);
+				fieldText = new Vector4(0.929f, 0.929f, 0.929f, 1f);
+				fieldAccent = new Vector4(1f, 0.98f, 0f, 1f);
+				fieldFocus = new Vector4(1f, 0.98f, 0f, 1f);
 			}
 		}
 		catch (Exception e) { Log.Debug(e, "INPA: 输入框设置页绘制失败"); }
@@ -3218,6 +3464,8 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 	// （支持中文、候选词定位），打出来的字实时镜像回页面那个框，看起来就跟直接在页面里打字一样。
 
 	private static bool fieldActive;
+	private static bool fieldKeysOnly;
+	private static bool fieldGuardRawEscDown;
 	private static float fieldW, fieldH, fieldRx, fieldRy;
 	/* 页面视口（整张网页）在游戏屏幕上的原点。定位输入框覆盖层的正确做法是
 	   「视口原点 + 字段在页面里的坐标 * 缩放」，而不是「鼠标位置 - 点进框里的偏移」——
@@ -3228,6 +3476,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 	private static float fieldRl, fieldRt;   // 字段在页面视口里的左上角（CSS px）
 	private static bool fieldHasClick;       // 这次的框是"鼠标点开的"吗
 	private static float fieldCx, fieldCy;   // 点开时，鼠标点在页面视口里的坐标
+	private static float fieldRequestDy;     // 页面按字段指定的纵向微调（CSS px）
 	private static bool fieldMulti;          // 多行框（页面里的 textarea，比如宏内容）
 	/* 聊天框那种「回车=发送、输入框不关」的框：页面在 /field 里带 keep=1 */
 	private static bool fieldKeepOnEnter;
@@ -3325,8 +3574,11 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		/* 页面回传的值和当前正在编辑的内容不一样 → 说明页面把我们刚打的字覆盖回去了（会表现为"按键没反应"） */
 		if (active && fieldActive && value != null && fieldBuf != null && value != fieldBuf)
 			Audit("输入框：页面回传了 " + value.Length + " 字的值，覆盖了当前正在编辑的 " + fieldBuf.Length + " 字内容");
+		fieldKeysOnly = false;
 		fieldActive = active;
+		fieldGuardRawEscDown = false;
 		fieldW = w; fieldH = h; fieldRx = rx; fieldRy = ry;
+		fieldRequestDy = 0f;
 		fieldBuf = value ?? string.Empty;
 		fieldFrames = 0;
 		fieldHadFocus = false;
@@ -3364,7 +3616,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		/* 带上 seq：页面靠它判断"插件报的 active=false"是不是自己刚发的那一条，
 		   免得切输入框时把新开的那条误判成"插件已经结束"。 */
 		/* enter：聊天框专用的"回车发送"计数（每次回车 +1），页面拿它去重后发消息。 */
-		return new { ok = true, active = fieldActive, text = fieldBuf, seq = fieldSeq, enter = fieldEnterSeq, esc = fieldEscSeq };
+		return new { ok = true, active = fieldActive || fieldKeysOnly, keysOnly = fieldKeysOnly, text = fieldBuf, seq = fieldSeq, enter = fieldEnterSeq, esc = fieldEscSeq };
 	}
 
 	private async Task<object> HandleFieldPostAsync(HttpListenerRequest req)
@@ -3384,6 +3636,12 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 					try { return (float)e.GetDouble(); } catch { }
 				}
 				return 0f;
+			}
+			string S(string n)
+			{
+				if (root.TryGetProperty(n, out var e) && e.ValueKind == JsonValueKind.String)
+					return e.GetString() ?? "";
+				return "";
 			}
 			string value = "";
 			if (root.TryGetProperty("value", out var vEl) && vEl.ValueKind == JsonValueKind.String) value = vEl.GetString() ?? "";
@@ -3412,12 +3670,46 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 			fieldRl = F("rl"); fieldRt = F("rt");
 			fieldMulti = F("multi") > 0.5f;   // 页面把它标成 textarea 时用多行编辑器
 			fieldKeepOnEnter = F("keep") > 0.5f;   // 聊天框：回车只发送，不关输入框
+			bool keysOnly = root.TryGetProperty("keys", out var keysEl) &&
+				(keysEl.ValueKind == JsonValueKind.True ||
+				 (keysEl.ValueKind == JsonValueKind.Number && keysEl.TryGetDouble(out var keysNum) && keysNum > 0));
+			/* 页面按当前版本传入输入框视觉 token；比只靠发包目录里的主题文件更可靠，
+			   同一份插件也能在 INPA / 普林斯顿 / 通用版之间即时切换配色。 */
+			if (active)
+			{
+				var bg = S("fbg");
+				var border = S("fborder");
+				var text = S("ftx");
+				var accent = S("faccent");
+				var focus = S("ffocus");
+				if (bg.Length > 0) fieldPageBg = ParseColor(bg, fieldPageBg);
+				if (border.Length > 0) fieldPageBorder = ParseColor(border, fieldPageBorder);
+				if (text.Length > 0) fieldPageText = ParseColor(text, fieldPageText);
+				if (accent.Length > 0) fieldPageAccent = ParseColor(accent, fieldPageAccent);
+				if (focus.Length > 0) fieldPageFocus = ParseColor(focus, fieldPageFocus);
+				var radius = F("fradius");
+				if (radius > 0f) fieldPageRadius = Math.Clamp(radius, 0f, 24f);
+				fieldPageTheme = bg.Length > 0 || border.Length > 0 || text.Length > 0 ||
+					accent.Length > 0 || focus.Length > 0 || radius > 0f;
+			}
+			else fieldPageTheme = false;
 			bool hasClick = root.TryGetProperty("click", out var cEl) && cEl.ValueKind == JsonValueKind.True;
 			if (hasClick) { fieldCx = F("cx"); fieldCy = F("cy"); }
 			fieldHasClick = hasClick && active;
 			if (active != fieldActive) Audit("输入框：" + (active ? "开始编辑" : "结束编辑") + "（seq=" + seq + (active ? (hasClick ? "，鼠标点开" : (fieldOriginValid ? "，页面自动聚焦，沿用上次位置" : "，页面自动聚焦，还没量过位置")) : "") + "）");
-			SetFieldTarget(active, F("w"), F("h"), F("rx"), F("ry"), value);
-			return new { ok = true, active = fieldActive };
+			if (active && keysOnly)
+			{
+				SetFieldTarget(false, 0f, 0f, 0f, 0f, null);
+				fieldKeysOnly = true;
+				fieldGuardRawEscDown = (GetAsyncKeyState(0x1B) & 0x8000) != 0;
+				fieldFrames = 0;
+			}
+			else
+			{
+				SetFieldTarget(active, F("w"), F("h"), F("rx"), F("ry"), value);
+				if (active) fieldRequestDy = F("fdy");
+			}
+			return new { ok = true, active = fieldActive || fieldKeysOnly, keysOnly = fieldKeysOnly, seq = fieldSeq, enter = fieldEnterSeq, esc = fieldEscSeq };
 		}
 		catch (Exception e)
 		{
@@ -3498,6 +3790,18 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 	private static void DrawOverlayHook()
 	{
 		LearnFieldOrigin();
+		if (!fieldFontWarm)
+		{
+			try
+			{
+				LoadFieldAlign();
+				var px = 14f * Math.Clamp(fieldScale, 0.5f, 3f) * fieldFontScale;
+				EnsureFieldFont(px);
+			}
+			catch { }
+			fieldFontWarm = true;
+		}
+		if (fieldKeysOnly) DrawFieldKeyGuard();
 		DrawFieldInput();
 	}
 
@@ -3565,6 +3869,40 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		return 0;
 	}
 
+	private static void DrawFieldKeyGuard()
+	{
+		var io = ImGui.GetIO();
+		/* 模态框没有输入框时也要把下一次 Esc 留在插件这一层。窗口本身不绘制、
+		   不接鼠标，只占一个屏幕外的键盘焦点；物理键兜底防止 Dalamud 漏转。 */
+		io.WantCaptureKeyboard = true;
+		io.WantTextInput = false;
+		var flags = ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoMove
+			| ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse | ImGuiWindowFlags.NoCollapse
+			| ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.NoBackground | ImGuiWindowFlags.NoMouseInputs
+			| ImGuiWindowFlags.NoDocking;
+		ImGui.SetNextWindowPos(new Vector2(-10000f, -10000f), ImGuiCond.Always);
+		ImGui.SetNextWindowSize(new Vector2(8f, 8f), ImGuiCond.Always);
+		if (fieldFrames == 0)
+		{
+			ImGui.SetNextWindowFocus();
+			fieldGuardRawEscDown = (GetAsyncKeyState(0x1B) & 0x8000) != 0;
+		}
+		ImGui.Begin("##inpaModalKeyGuard", flags);
+		var escImGui = ImGui.IsKeyPressed(ImGuiKey.Escape);
+		var escPhys = (GetAsyncKeyState(0x1B) & 0x8000) != 0;
+		var escJust = escPhys && !fieldGuardRawEscDown;
+		fieldGuardRawEscDown = escPhys;
+		if (escImGui || escJust)
+		{
+			fieldEscSeq++;
+			fieldActive = false;
+			fieldKeysOnly = false;
+			Audit("输入框：模态框键盘守卫收到 Esc");
+		}
+		ImGui.End();
+		fieldFrames++;
+	}
+
 	private static unsafe void InsertAsciiByte(ref ImGuiInputTextCallbackData d, int pos, byte c)
 	{
 		if (pos < 0 || pos > d.BufTextLen) return;
@@ -3595,13 +3933,40 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		{
 			var io = ImGui.GetIO();
 			LoadFieldAlign();
+			Vector4 drawBg, drawBorder, drawText, drawAccent, drawFocus;
+			float drawRadius;
+			var autoLayout = FieldLayoutModeForProfile(fieldDetectedProfile);
+			if (fieldLayoutMode == 0 && autoLayout > 0 &&
+				TryGetFieldLayoutPreset(autoLayout, out drawBg, out drawBorder, out drawText,
+					out drawAccent, out drawFocus, out drawRadius))
+			{
+				/* 自动识别到网页版本时，使用该版式预设，避免网页传来半更新颜色导致混色。 */
+			}
+			else if (fieldPageTheme)
+			{
+				drawBg = fieldPageBg;
+				drawBorder = fieldPageBorder;
+				drawText = fieldPageText;
+				drawAccent = fieldPageAccent;
+				drawFocus = fieldPageFocus;
+				drawRadius = fieldPageRadius;
+			}
+			else
+			{
+				drawBg = fieldBg;
+				drawBorder = fieldBorder;
+				drawText = fieldText;
+				drawAccent = fieldAccent;
+				drawFocus = fieldFocus;
+				drawRadius = fieldRadius;
+			}
 			var imGuiWantsText = io.WantTextInput;   // 记住 ImGui 自己的判断（下面会把它改成 true）
+			var anchor = io.MousePos;
+			var w = fieldW > 8f ? fieldW : 320f;
+			var h = fieldH > 8f ? fieldH : 26f;
+			bool rectOk = fieldRl > -8000f && fieldRl < 20000f && fieldRt > -8000f && fieldRt < 20000f;
 			if (fieldFrames == 0)
 			{
-				var anchor = io.MousePos;
-				var w = fieldW > 8f ? fieldW : 320f;
-				var h = fieldH > 8f ? fieldH : 26f;
-				bool rectOk = fieldRl > -8000f && fieldRl < 20000f && fieldRt > -8000f && fieldRt < 20000f;
 				if (fieldHasClick)
 				{
 					/* 鼠标点开的框：此刻鼠标就在框里，视口原点 = 鼠标位置 - 点击点在页面里的坐标*缩放。量下来记住。 */
@@ -3617,12 +3982,14 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 					fieldOriginX = anchor.X - rxf * fieldScale - (rectOk ? fieldRl * fieldScale : 0f);
 					fieldOriginY = anchor.Y - ryf * fieldScale - (rectOk ? fieldRt * fieldScale : 0f);
 				}
-				/* 不管哪种情况，最终都是「视口原点 + 字段在页面里的坐标*缩放 + 校准偏移」 */
-				fieldScreenPos = new Vector2(
-					fieldOriginX + (rectOk ? fieldRl : 0f) * fieldScale + fieldDx,
-					fieldOriginY + (rectOk ? fieldRt : 0f) * fieldScale + fieldDy);
-				fieldSize = new Vector2(Math.Clamp(w * fieldScale, 60f, 2000f), Math.Clamp(h * fieldScale, 14f, 300f));
 			}
+			/* 页面点击和自动聚焦可能分成两条请求到达。位置每帧重算，
+			   后到的 /click 一旦量出视口原点，下一帧就立即把覆盖框摆正，
+			   不会把第一次用旧原点算出的位置一直冻结到下次聚焦。 */
+			fieldScreenPos = new Vector2(
+				fieldOriginX + (rectOk ? fieldRl : 0f) * fieldScale + fieldDx,
+				fieldOriginY + (rectOk ? fieldRt : 0f) * fieldScale + fieldDy + fieldRequestDy * fieldScale);
+			fieldSize = new Vector2(Math.Clamp(w * fieldScale, 60f, 2000f), Math.Clamp(h * fieldScale, 14f, 300f));
 			/* 窗口比字段四周各大 2px：ImGui 按窗口矩形裁剪绘制，紧贴窗口底边的那一行会被裁掉，
 			   原来 1px 的边框和下面两个圆角就是这么消失的。留 2px 余量后，再用同样的 WindowPadding
 			   把内容原点推回字段左上角，盒子位置和以前一模一样（不用重新校准）。 */
@@ -3640,8 +4007,8 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 				| ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse | ImGuiWindowFlags.NoCollapse
 				| ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.NoBackground
 				| ImGuiWindowFlags.NoDocking;
-			/* 和页面的输入框严格对齐：内边距按字段高度算（框高一致），颜色取自页面 CSS：
-			   深底 #171219 / 聚焦金边 #e8c96a / 字色 #f2ecf7 / 圆角 8px / 1px 边框。 */
+			/* 和页面的输入框严格对齐：尺寸与位置不随配色变化，颜色由页面按当前版本
+			   发来的 token 决定；只有边框、左侧信号导轨和右上角标记承担状态提示。 */
 			/* 页面里的字号是 14px、内边距 8/10px，但页面在游戏里是按 fieldScale 倍渲染的（校准里的 scale），
 			   所以覆盖层的字号和内边距都跟着乘。字号是"按尺寸重新加载一份字体"，不是把 14px 的字形拉大
 			   （拉大会又糊又胖）；只有改了校准里的缩放才会重建。 */
@@ -3653,7 +4020,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 				: MathF.Round(Math.Max(1f, (boxH - fh) / 2f));          // 单行：垂直居中
 			ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, new Vector2(2f, 2f));
 			ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(padX, padY));
-			ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, fieldRadius);
+			ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, drawRadius);
 			ImGui.PushStyleVar(ImGuiStyleVar.FrameBorderSize, 0f);
 			/* 自带底板/边框交给下面的手绘（ImGui 自己的 FrameBg 会在窗口底边被裁，四角不齐）；
 			   这里把它的各种状态色全设成透明，免得聚焦时又冒出一层别的颜色。 */
@@ -3662,7 +4029,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 			ImGui.PushStyleColor(ImGuiCol.FrameBgActive, new Vector4(0f, 0f, 0f, 0f));
 			ImGui.PushStyleColor(ImGuiCol.Border, new Vector4(0f, 0f, 0f, 0f));
 			ImGui.PushStyleColor(ImGuiCol.BorderShadow, new Vector4(0f, 0f, 0f, 0f));
-			ImGui.PushStyleColor(ImGuiCol.Text, fieldText);
+			ImGui.PushStyleColor(ImGuiCol.Text, drawText);
 			ImGui.Begin("##inpaFieldOverlay", flags);
 			/* 这里原本每帧强行把 io.WantCaptureKeyboard / io.WantTextInput 写成 true。
 			   实测没必要：输入框被"鼠标方式"激活后（见下面那次补点击），ImGui 自己就会把这两个标志报成 true，
@@ -3691,14 +4058,34 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 			bool needFocus = !calOpen && (fieldFrames < 3 || !fieldHadFocus);
 			if (needFocus) ImGui.SetKeyboardFocusHere();
 			ImGui.SetNextItemWidth(-1f);
-			/* 自己把输入框的底板和 1px 边框画出来：四个圆角一定是圆的。
-			   深底 #171219 / 边框 #3A2F47 / 字色 #f2ecf7，和页面 CSS 一致。
+			/* 自己把输入框的底板、边框、左侧信号导轨和右上角标画出来。
+			   使用页面传来的背景 / 边框 / 文字 / 强调色，三版共用同一几何结构。
 			   注意要画在 InputText 之前，字才压在底板上。 */
 			var boxMin = ImGui.GetCursorScreenPos();
 			var boxMax = new Vector2(boxMin.X + boxW, boxMin.Y + boxH);
 			var fieldDl = ImGui.GetWindowDrawList();
-			fieldDl.AddRectFilled(boxMin, boxMax, ImGui.GetColorU32(fieldBg), fieldRadius, ImDrawFlags.RoundCornersAll);
-			fieldDl.AddRect(new Vector2(boxMin.X + 0.5f, boxMin.Y + 0.5f), new Vector2(boxMax.X - 0.5f, boxMax.Y - 0.5f), ImGui.GetColorU32(fieldBorder), Math.Max(0f, fieldRadius - 0.5f), ImDrawFlags.RoundCornersAll, 1f);
+			fieldDl.AddRectFilled(boxMin, boxMax, ImGui.GetColorU32(drawBg), drawRadius, ImDrawFlags.RoundCornersAll);
+			var accentW = Math.Clamp(MathF.Round(4f * scale), 3f, 8f);
+			fieldDl.AddRectFilled(
+				boxMin,
+				new Vector2(boxMin.X + accentW, boxMax.Y),
+				ImGui.GetColorU32(drawAccent),
+				drawRadius,
+				ImDrawFlags.RoundCornersLeft);
+			var borderThick = Math.Max(1f, MathF.Round(scale));
+			fieldDl.AddRect(
+				new Vector2(boxMin.X + 0.5f, boxMin.Y + 0.5f),
+				new Vector2(boxMax.X - 0.5f, boxMax.Y - 0.5f),
+				ImGui.GetColorU32(drawFocus),
+				Math.Max(0f, drawRadius - 0.5f),
+				ImDrawFlags.RoundCornersAll,
+				borderThick);
+			var mark = Math.Clamp(MathF.Round(6f * scale), 4f, 12f);
+			var markInset = Math.Clamp(MathF.Round(7f * scale), 5f, 14f);
+			var markX = boxMax.X - markInset;
+			var markY = boxMin.Y + markInset;
+			fieldDl.AddLine(new Vector2(markX - mark, markY), new Vector2(markX, markY), ImGui.GetColorU32(drawAccent), 1f);
+			fieldDl.AddLine(new Vector2(markX, markY), new Vector2(markX, markY + mark), ImGui.GetColorU32(drawAccent), 1f);
 			bool enter;
 			var bufBefore = fieldBuf;
 			/* 只有真的攒了"待补/待删"动作时才挂回调 —— 正常打字这条路径就跟普通插件的
@@ -3980,7 +4367,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 	private static void OnInpaReloadCommand(string command, string args) { BwOverlay("reload"); }
 	private static void OnInpaCalCommand(string command, string args)
 	{
-		OpenConfigTab(2);
+		OpenConfigTab(1);
 		ChatGui.Print("INPA：已打开「输入框设置」");
 	}
 		private static void OnInpaCommand(string command, string args)
@@ -3992,11 +4379,8 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		switch (head)
 		{
 			case "cal":
-				OpenConfigTab(2);
+				OpenConfigTab(1);
 				ChatGui.Print("INPA：已打开「输入框设置」");
-				break;
-			case "page":
-				OnInpaPageCommand();
 				break;
 			case "show": BwOverlay("hidden on"); break;
 			case "hide": BwOverlay("hidden off"); break;
@@ -4218,18 +4602,17 @@ case "reload": BwOverlay("reload"); break;
 	   等于你随手打开的网页都能发起交易 / 代你发聊天。现在收紧：
 	     · 口令：数据目录下 inpa-token.txt（首次自动生成）。请求带 ?t=口令 或 X-InPA-Token 头。
 	     · 来源：本机页面（127.0.0.1 / localhost / [::1]，任意端口）自动放行；
-	             其它域名要写在数据目录的 allow-origins.txt 里（一行一个，例如 https://inpa.example.com）。
+	             托管网页必须带通用档案口令，不依赖浏览器来源。
 	     · /ping 和插件自己发的页面不校验口令（页面靠 /ping 探测连接；它自己发的页面里带了口令）。
 	     · 插件发页面时会把这个口令注入进去（window.__INPA_TOKEN），本机模式用起来无感。 */
 	private static string? tokenCache;
 	private static string? tokenCacheDir;   // 这份口令是哪个店的——两个店各有各的 inpa-token.txt，切店后必须重读
-	private static List<string> allowedOrigins = new List<string>();
-	private static long originsReadAt;
 
-	private static string? DataDir()
+	private static string? DataDir(string webProfile = "")
 	{
 		try
 		{
+			if (webProfile.Length > 0) return Path.Combine(WebDataRoot(webProfile), "data");
 			var f = StateFile();
 			return string.IsNullOrEmpty(f) ? null : Path.GetDirectoryName(f);
 		}
@@ -4237,11 +4620,11 @@ case "reload": BwOverlay("reload"); break;
 	}
 
 	/// <summary>本机访问口令：数据目录里的 inpa-token.txt，没有就生成一个。</summary>
-	internal static string AccessToken()
+	internal static string AccessToken(string webProfile = "")
 	{
 		try
 		{
-			var dir = DataDir();
+			var dir = DataDir(webProfile);
 			if (string.IsNullOrEmpty(dir)) return "";
 			/* 缓存要跟着"是哪个店"走：以前只判断 tokenCache 非空，切店（page.txt 指向另一个 app.html）
 			   之后还沿用上一个店的口令 —— 于是两个店显示/校验的都是同一个口令。 */
@@ -4253,9 +4636,10 @@ case "reload": BwOverlay("reload"); break;
 				var t = File.ReadAllText(file, Encoding.UTF8).Trim();
 				if (t.Length > 0) { tokenCacheDir = dir; return tokenCache = t; }
 			}
-			var made = Guid.NewGuid().ToString("N").Substring(0, 20);
+			var bytes = RandomNumberGenerator.GetBytes(24);
+			var made = Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
 			File.WriteAllText(file, made, new UTF8Encoding(false));
-			Log.Information("INPA Bridge: 已生成访问口令（网页连接时要填）：{0}", new object[1] { made });
+			try { Log.Information("INPA Bridge: 已生成访问口令（网页连接时要填）：{0}", new object[1] { made }); } catch { }
 			tokenCacheDir = dir;
 			return tokenCache = made;
 		}
@@ -4266,36 +4650,10 @@ case "reload": BwOverlay("reload"); break;
 		}
 	}
 
-	/// <summary>allow-origins.txt 里的白名单（每 10 秒重读一次，改了不用重启插件）。</summary>
-	private static List<string> AllowedOrigins()
-	{
-		if (Environment.TickCount64 - originsReadAt < 10000) return allowedOrigins;
-		originsReadAt = Environment.TickCount64;
-		var list = new List<string>();
-		try
-		{
-			var dir = DataDir();
-			var file = string.IsNullOrEmpty(dir) ? null : Path.Combine(dir!, "allow-origins.txt");
-			if (file != null && File.Exists(file))
-			{
-				foreach (var line in File.ReadAllLines(file, Encoding.UTF8))
-				{
-					var s = line.Trim();
-					if (s.Length == 0 || s.StartsWith("#")) continue;
-					list.Add(s.TrimEnd('/').ToLowerInvariant());
-				}
-			}
-		}
-		catch (Exception e) { Log.Debug(e, "INPA Bridge: 读来源白名单失败"); }
-		allowedOrigins = list;
-		return list;
-	}
-
 	private static bool OriginAllowed(string origin)
 	{
 		if (string.IsNullOrEmpty(origin)) return true;   // 同源 GET / 本机程序 / curl：没有 Origin
-		/* file:// 页面（Origin: null）：网页端已停用，一律不放行。
-		   本机 exe / 游戏内窗口都是 127.0.0.1 来源，不受影响。 */
+		/* file:// 页面（Origin: null）必须通过口令，不能仅凭来源放行。 */
 		if (origin.Trim().Equals("null", StringComparison.OrdinalIgnoreCase)) return false;
 		var o = origin.TrimEnd('/').ToLowerInvariant();
 		try
@@ -4304,17 +4662,20 @@ case "reload": BwOverlay("reload"); break;
 			if (host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]") return true;   // 本机页面
 		}
 		catch { }
-		foreach (var a in AllowedOrigins()) if (a == o) return true;
 		return false;
 	}
 
-	private static bool TokenOk(HttpListenerRequest req)
+	private static bool TokenOk(HttpListenerRequest req, string webProfile)
 	{
-		var tok = AccessToken();
-		if (tok.Length == 0) return true;   // 连数据目录都还没确定：不拦（老行为）
+		if (string.IsNullOrEmpty(webProfile)) return false;
+		var tok = AccessToken(webProfile);
+		if (tok.Length == 0) return false;
 		var got = req.QueryString["t"];
 		if (string.IsNullOrEmpty(got)) got = req.Headers["X-InPA-Token"];
-		return !string.IsNullOrEmpty(got) && got == tok;
+		if (string.IsNullOrEmpty(got)) return false;
+		var expected = Encoding.UTF8.GetBytes(tok);
+		var actual = Encoding.UTF8.GetBytes(got);
+		return expected.Length == actual.Length && CryptographicOperations.FixedTimeEquals(expected, actual);
 	}
 
 	/* ---------------------------------------------------------------- WebSocket 实时推送（/ws）
@@ -4408,8 +4769,9 @@ case "reload": BwOverlay("reload"); break;
 	private static string lastStatePostAt = "";
 
 	/// <summary>数据文件位置：app.html 同级的 data\inpa-data.json（和启动器共用）。</summary>
-	private static string? StateFile()
+	private static string? StateFile(string webProfile = "")
 	{
+		if (webProfile.Length > 0) return Path.Combine(WebDataRoot(webProfile), "data", "inpa-data.json");
 		lock (StateLock)
 		{
 			string? page = null;
@@ -4436,13 +4798,13 @@ case "reload": BwOverlay("reload"); break;
 		}
 	}
 
-	private static object HandleStateGet()
+	private static object HandleStateGet(string webProfile)
 	{
 		lock (StateLock)
 		{
 			try
 			{
-				var path = StateFile();
+				var path = StateFile(webProfile);
 				if (path == null) return new { ok = false, error = "找不到数据文件位置" };
 				if (!File.Exists(path)) return new { ok = true, rev = 0L, updatedAt = "", data = (JsonElement?)null, path };
 				using var doc = JsonDocument.Parse(ReadStateText(path));
@@ -4460,7 +4822,7 @@ case "reload": BwOverlay("reload"); break;
 		}
 	}
 
-	private async Task<object> HandleStatePostAsync(HttpListenerRequest req)
+	private async Task<object> HandleStatePostAsync(HttpListenerRequest req, string webProfile)
 	{
 		string body;
 		using (var reader = new StreamReader(req.InputStream, req.ContentEncoding ?? Encoding.UTF8))
@@ -4488,7 +4850,7 @@ case "reload": BwOverlay("reload"); break;
 		{
 			try
 			{
-				var path = StateFile();
+				var path = StateFile(webProfile);
 				if (path == null) return new { ok = false, error = "找不到数据文件位置" };
 				/* 插件与 exe 是两个进程：进程内锁只能挡住各自线程，必须再用同一把跨进程文件锁包住整个读-改-写事务。 */
 				using var stateFileLock = AcquireStateWriteLock(path);

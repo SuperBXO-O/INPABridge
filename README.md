@@ -49,7 +49,30 @@ cd INPABridge
 dotnet build -c Release
 ```
 
-产物在 `bin/Release/`：`INPABridge.dll` + `INPABridge.json` + `INPABridge.deps.json`。把这三个文件打进一个 zip 就是插件包。
+产物在 `bin/Release/`：`INPABridge.dll` + `INPABridge.json` + `INPABridge.deps.json`。
+
+## 插件包结构（重要）
+
+编译产物只是三个文件，**直接打包会缺页面**。完整的 `latest.zip` 必须是：
+
+```
+INPABridge.dll
+INPABridge.json
+INPABridge.deps.json
+field-theme.txt
+www/
+  └── generic/
+      └── index.html
+```
+
+说明：
+
+- `www/{profile}/index.html` 是内嵌网页，插件从自身目录读取后提供给游戏内浏览器。
+  `profile` 取值 `generic`（通用版）/ `inpa`（INPA）/ `princeton`（普林斯顿），
+  游戏内可在插件窗口切换。
+- `field-theme.txt` 决定游戏内输入框样式，与页面版本配套。
+- 这两样都不是编译产物，来自 `INPA-前台帮手-完整包` 工程的构建输出
+  （`上传用\index.html` 与 `field-themes\*.txt`），打包时必须一并放入。
 
 ## 许可
 
