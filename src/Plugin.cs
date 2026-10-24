@@ -1446,6 +1446,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 	private static readonly object SendGate = new object();
 	private static long nextSendAt;                 // Environment.TickCount64
 	private const int SendGapMs = 1500;
+	private const int RoomStatusLineGapMs = 350;
 
 	private static async Task WaitSendSlot()
 	{
@@ -1683,22 +1684,36 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 			return new { ok = false, error = "没有可发送的包间信息" };
 		}
 		string command = "/" + channel;
-		bool ok = await RunOnFramework(delegate
+		Audit("包间情况 → " + command + "，共 " + lines.Count + " 行（按游戏节流逐行发送）");
+		bool allSent = true;
+		int lineNo = 0;
+		foreach (string line in lines)
 		{
-			bool allSent = true;
-			foreach (string line in lines)
+			lineNo++;
+			try
 			{
-				if (!SendToChatBox(command + " " + line)) allSent = false;
+				if (lineNo > 1)
+				{
+					await Task.Delay(RoomStatusLineGapMs).ConfigureAwait(continueOnCapturedContext: false);
+				}
+				bool sent = await RunOnFramework(() => SendToChatBox(command + " " + line)).ConfigureAwait(continueOnCapturedContext: false);
+				if (!sent) allSent = false;
+				Log.Information("INPA Bridge: 包间情况已发送（{0}/{1}）→ {2} {3}",
+					new object[4] { lineNo, lines.Count, command, line });
 			}
-			return allSent;
-		}).ConfigureAwait(continueOnCapturedContext: false);
-		Audit("包间情况 → " + command + "，共 " + lines.Count + " 行（连续发送）");
+			catch (Exception ex)
+			{
+				allSent = false;
+				Log.Error(ex, "INPA Bridge: 包间情况发送失败 -> {0} {1}", new object[2] { command, line });
+			}
+		}
 		return new
 		{
-			ok = ok,
+			ok = allSent,
 			channel = command,
 			lines = lines.Count,
-			error = ok ? "" : "游戏聊天框当前不可发送"
+			throttleMs = RoomStatusLineGapMs,
+			error = allSent ? "" : "部分包间信息发送失败"
 		};
 	}
 
