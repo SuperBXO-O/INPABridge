@@ -47,6 +47,7 @@ using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.System.String;
 using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
+using FFXIVClientStructs.FFXIV.Client.UI.Info;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 using Lumina.Excel;
 using Lumina.Excel.Sheets;
@@ -539,7 +540,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 				{
 					ok = true,
 					name = "INPA Bridge",
-					version = "1.7.84",
+					version = "1.7.85",
 					api = 15,
 					port = 18500,
 					bound = boundPrefix
@@ -553,6 +554,12 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 				break;
 			case "/notify":
 				payload = await HandleNotifyAsync(request).ConfigureAwait(continueOnCapturedContext: false);
+				break;
+			case "/channels":
+				payload = await HandleChannelsAsync().ConfigureAwait(continueOnCapturedContext: false);
+				break;
+			case "/room-status/send":
+				payload = await HandleRoomStatusSendAsync(request).ConfigureAwait(continueOnCapturedContext: false);
 				break;
 			case "/events":
 				payload = HandleEvents(request);
@@ -1604,6 +1611,94 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		{
 			ok = await RunOnFramework(() => SendToChatBox(line)).ConfigureAwait(continueOnCapturedContext: false),
 			channel = cmd
+		};
+	}
+
+	private unsafe Task<object> HandleChannelsAsync()
+	{
+		return RunOnFramework((Func<object>)delegate
+		{
+			List<object> channels = new List<object>();
+			InfoModule* infoModule = InfoModule.Instance();
+			InfoProxyCrossWorldLinkshell* proxy = infoModule == null
+				? null
+				: infoModule->GetInfoProxyCrossWorldLinkshell();
+			for (int i = 0; i < 8; i++)
+			{
+				string name = "";
+				if (proxy != null)
+				{
+					try { name = proxy->CrossWorldLinkshells[i].Name.ToString() ?? ""; }
+					catch (Exception ex) { Log.Debug(ex, "INPA Bridge: 读取跨服贝 {0} 名称失败", new object[1] { i + 1 }); }
+				}
+				channels.Add(new
+				{
+					id = "cwl" + (i + 1),
+					slot = i + 1,
+					command = "/cwl" + (i + 1),
+					name = name
+				});
+			}
+			return new { ok = true, channels = channels };
+		});
+	}
+
+	private async Task<object> HandleRoomStatusSendAsync(HttpListenerRequest req)
+	{
+		string raw;
+		using (StreamReader reader = new StreamReader(req.InputStream, req.ContentEncoding ?? Encoding.UTF8))
+		{
+			raw = await reader.ReadToEndAsync().ConfigureAwait(continueOnCapturedContext: false);
+		}
+		string channel = "";
+		List<string> lines = new List<string>();
+		try
+		{
+			using JsonDocument doc = JsonDocument.Parse(raw);
+			if (doc.RootElement.TryGetProperty("channel", out JsonElement channelElement))
+			{
+				channel = (channelElement.GetString() ?? "").Trim().ToLowerInvariant();
+			}
+			if (doc.RootElement.TryGetProperty("lines", out JsonElement lineElement) &&
+				lineElement.ValueKind == JsonValueKind.Array)
+			{
+				foreach (JsonElement item in lineElement.EnumerateArray())
+				{
+					string line = (item.GetString() ?? "").Replace('\r', ' ').Replace('\n', ' ').Trim();
+					if (line.Length > 0) lines.Add(line);
+					if (lines.Count >= 200) break;
+				}
+			}
+		}
+		catch (JsonException)
+		{
+			return new { ok = false, error = "请求内容不是有效 JSON" };
+		}
+		if (!Regex.IsMatch(channel, "^cwl[1-8]$", RegexOptions.CultureInvariant))
+		{
+			return new { ok = false, error = "只能发送到跨服贝 1～8" };
+		}
+		if (lines.Count == 0)
+		{
+			return new { ok = false, error = "没有可发送的包间信息" };
+		}
+		string command = "/" + channel;
+		bool ok = await RunOnFramework(delegate
+		{
+			bool allSent = true;
+			foreach (string line in lines)
+			{
+				if (!SendToChatBox(command + " " + line)) allSent = false;
+			}
+			return allSent;
+		}).ConfigureAwait(continueOnCapturedContext: false);
+		Audit("包间情况 → " + command + "，共 " + lines.Count + " 行（连续发送）");
+		return new
+		{
+			ok = ok,
+			channel = command,
+			lines = lines.Count,
+			error = ok ? "" : "游戏聊天框当前不可发送"
 		};
 	}
 
