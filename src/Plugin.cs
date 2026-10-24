@@ -540,7 +540,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 				{
 					ok = true,
 					name = "INPA Bridge",
-					version = "1.7.86",
+					version = "1.7.87",
 					api = 15,
 					port = 18500,
 					bound = boundPrefix
@@ -1446,7 +1446,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 	private static readonly object SendGate = new object();
 	private static long nextSendAt;                 // Environment.TickCount64
 	private const int SendGapMs = 1500;
-	private const int RoomStatusLineGapMs = 350;
+	private const int RoomStatusLineGapMs = 150;
 
 	private static async Task WaitSendSlot()
 	{
