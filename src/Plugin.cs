@@ -540,7 +540,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 				{
 					ok = true,
 					name = "INPA Bridge",
-					version = "1.7.85",
+					version = "1.7.86",
 					api = 15,
 					port = 18500,
 					bound = boundPrefix
