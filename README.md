@@ -121,6 +121,11 @@ NOTICE
 
 ## Release notes
 
+### 1.7.91
+
+- Added a local physical-modifier endpoint so Ctrl-click multi-select works inside the Browsingway in-game window even when CEF does not include `ctrlKey` on mouse events.
+- Added the updated web-page bridge used by the latest Front Desk Helper release.
+
 ### 1.7.90
 
 - Fixed room alerts reading the plugin's default data directory instead of the active web profile's shared data file.

@@ -496,6 +496,10 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 				payload = await HandleClickPostAsync(request).ConfigureAwait(false);
 				break;
 
+			case "/modifier":
+				payload = PhysicalModifierState();
+				break;
+
 			case "/export":
 				payload = await HandleExportAsync(request, webProfile).ConfigureAwait(false);
 				break;
@@ -3967,6 +3971,18 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		{
 			return new { ok = false, error = e.Message };
 		}
+	}
+
+	/* Browsingway 的鼠标点击不一定携带 Ctrl 修饰状态；页面在游戏内需要多选时，
+	   通过这个本地接口读取 Windows 物理按键，避免把 Ctrl 混入 FF14 的技能热键。 */
+	private static object PhysicalModifierState()
+	{
+		bool ctrl = (GetAsyncKeyState(0x11) & 0x8000) != 0;
+		bool shift = (GetAsyncKeyState(0x10) & 0x8000) != 0;
+		bool alt = (GetAsyncKeyState(0x12) & 0x8000) != 0;
+		bool meta = (GetAsyncKeyState(0x5B) & 0x8000) != 0 ||
+			(GetAsyncKeyState(0x5C) & 0x8000) != 0;
+		return new { ok = true, ctrl, shift, alt, meta };
 	}
 
 	/// <summary>绘制线程：把页面刚报来的那次点击换算成视口原点。</summary>
