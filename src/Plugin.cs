@@ -214,6 +214,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 	private static long phaseAt;
 
 	private static bool menuOpened;
+	private static long fillReadyAt;
 
 	private static readonly List<string> fillLog = new List<string>();
 
@@ -2460,6 +2461,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		fillQueue = null;
 		fillIndex = 0;
 		menuOpened = false;
+		fillReadyAt = 0L;
 		fillPhase = 1;
 		phaseAt = Environment.TickCount64;
 		Audit("收到交易请求：to=" + ((to.Length > 0) ? to : "(空)") + " → " + ((toName.Length > 0) ? toName : "(等窗口)") + "，物品 " + items.Count + " 种");
@@ -2628,6 +2630,10 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 				FillSlot fillSlot = fillQueue[fillIndex];
 				if (!menuOpened)
 				{
+					if (tickCount < fillReadyAt) return;
+					/* 上一个物品的右键菜单和数量框完全关闭后再开下一项。
+					   否则会复用旧菜单，表现为第二个绑定物品没有被放入。 */
+					if (FindAddonVisible(new string[1] { "ContextMenu" }) != null) return;
 					AgentInventoryContext* ptr = AgentInventoryContext.Instance();
 					if (ptr != null)
 					{
@@ -2672,19 +2678,38 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 				if (ptr4 != null)
 				{
 					TryConfirmQuantity(ptr4, fillQueue[fillIndex].Want);
-					fillIndex++;
 					menuOpened = false;
-					fillPhase = 2;
+					fillPhase = 4;
 					phaseAt = tickCount;
 				}
 				else if (tickCount - phaseAt > 1500)
 				{
 					Flog("未弹出数量框（可能整堆放入），继续下一个");
-					fillIndex++;
 					menuOpened = false;
-					fillPhase = 2;
+					fillPhase = 4;
 					phaseAt = tickCount;
 				}
+			}
+			else if (fillPhase == 4)
+			{
+				bool inputOpen = FindAddonVisible(new string[1] { "InputNumeric" }) != null;
+				bool menuOpen = FindAddonVisible(new string[1] { "ContextMenu" }) != null;
+				if (inputOpen || menuOpen)
+				{
+					if (tickCount - phaseAt > 4000)
+					{
+						Flog("等待上一个物品菜单关闭超时，中止本次放物");
+						fillPhase = 0;
+						pendingTrade = null;
+					}
+					return;
+				}
+				FillSlot finished = fillQueue[fillIndex];
+				fillIndex++;
+				Flog("物品位完成 slot=" + finished.Slot + "，准备下一项 " + fillIndex + "/" + fillQueue.Count);
+				fillReadyAt = tickCount + 120L;
+				fillPhase = 2;
+				phaseAt = tickCount;
 			}
 		}
 	}

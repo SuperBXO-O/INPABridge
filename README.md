@@ -67,12 +67,18 @@ field-theme.txt
 - **本插件不内置网页**，只提供本机 HTTP 服务（`127.0.0.1:18500`）与游戏内联动能力。
 - `field-theme.txt` 决定游戏内输入框配色，不是编译产物。
 - 页面由使用者自行提供，插件按以下顺序查找：
-  1. 插件目录下 `page.txt` 里写的路径
-  2. 插件目录下 `app.html`
-  3. 插件目录下 `www/{profile}/app.html`
-  4. 插件目录下 `www/{profile}/index.html`
+  1. 插件目录下 `page.txt` 里写的页面文件或文件夹路径
+  2. 当前网页数据目录下的 `app.html` / `index.html` / `上传用/index.html`
+  3. 插件目录下 `app.html` / `index.html`
+  4. 插件目录下 `www/app.html` / `www/index.html`
+  5. 插件目录下 `www/{profile}/app.html` / `www/{profile}/index.html`
 
   其中 `profile` 取值 `generic` / `inpa` / `princeton`，游戏内可在插件窗口切换。
+
+## 1.7.88
+
+- 双绑定业务交易时，等上一件物品的数量框和右键菜单完全关闭后再放入下一件，避免只放入第一件。
+- 同步最新前台页面及输入框主题、独立档案目录和房间状态发送逻辑。
 
 ## 许可
 
