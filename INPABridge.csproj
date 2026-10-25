@@ -6,10 +6,10 @@
   -->
 
   <PropertyGroup>
-    <Version>1.7.88.0</Version>
+    <Version>1.7.89.0</Version>
 
     <Name>INPA Bridge</Name>
-    <Author>INPA</Author>
+    <Author>SuperBXO-O</Author>
     <Punchline>为 INPA 前台帮手提供游戏联动：取目标 / 私聊 / 内嵌页面 / 背包 / 自动交易</Punchline>
     <Description>把前台帮手网页从本机 127.0.0.1:18500 发给游戏内浏览器加载，并提供取目标（名字@服务器）、代发聊天、读取背包、自动交易（放信物 / 金币）与交易事件回报。只在网页里点击时动作，不后台自动操作。</Description>
     <RepoUrl>https://github.com/SuperBXO-O/INPABridge</RepoUrl>
@@ -34,6 +34,7 @@
     <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
     <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
     <NoWarn>$(NoWarn);CS1591;CS8625;CS8600;CS8602;CS8604;CS8618;CS8629;CS0168;CS0219</NoWarn>
+    <DefaultItemExcludes>$(DefaultItemExcludes);tests/**</DefaultItemExcludes>
   </PropertyGroup>
 
 </Project>

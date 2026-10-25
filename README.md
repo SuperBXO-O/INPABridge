@@ -1,47 +1,86 @@
 # INPA Bridge
 
-FFXIV 插件（Dalamud）。为 **FF14 RP Front Desk Helper** 提供游戏内联动能力：
+INPA Bridge is a Dalamud plugin that connects a locally hosted FF14 role-play front desk page with the game.
 
-- 在内嵌浏览器里打开本机前台页面（`http://127.0.0.1:18500`）
-- 取当前目标（`名字@服务器`）
-- 代发聊天消息
-- 读取背包
-- 自动交易（放信物 / 金币）与交易事件回报
+It provides a local HTTP service at `127.0.0.1:18500` for:
 
-所有动作只在网页里点击时触发，不做后台自动操作。
+- reading the current target as `Name@World`
+- sending chat messages
+- reading inventory items
+- placing trade items and gil
+- reporting trade events
+- showing a local front desk page inside the game
+- storing shared front desk data on the user's computer
 
-## 安装
+Actions are initiated from the page or the plugin interface. The plugin does not perform background trading or messaging.
 
-在游戏内输入 `/xlsettings` → **Experimental** → **Custom Plugin Repositories**，把下面这条链接加进去，保存：
+## Author
 
-```
+**SuperBXO-O**
+
+Repository: https://github.com/SuperBXO-O/INPABridge
+
+## Requirements
+
+- Dalamud API Level 15
+- .NET 10
+- Final Fantasy XIV 7.5
+
+An incompatible Dalamud API level will prevent the plugin from loading.
+
+## Installation
+
+1. Open `/xlsettings` in game.
+2. Go to **Experimental** and open **Custom Plugin Repositories**.
+3. Add this URL:
+
+```text
 https://raw.githubusercontent.com/SuperBXO-O/INPABridge/main/repo.json
 ```
 
-然后 `/xlplugins` → 搜索 `INPA Bridge` → 安装。
+4. Open `/xlplugins`.
+5. Search for `INPA Bridge` and install it.
 
-## 前提
+## Commands
 
-本插件是「桥」，自身不带前台页面。需要本机已运行 INPA 前台帮手网页服务，否则插件能装上但页面打不开。
-
-## 命令
-
-| 命令 | 作用 |
+| Command | Action |
 |---|---|
-| `/inpa` | 打开/关闭主窗口 |
-| `/inpalock` | 锁定/解锁窗口位置 |
-| `/inpareload` | 重载内嵌页面 |
-| `/inpacal` | 打开日历 |
+| `/inpa` | Show or hide the in-game page window |
+| `/inpalock` | Toggle window position locking |
+| `/inpareload` | Reload the embedded page |
+| `/inpacal` | Open the input-overlay calibration tab |
 
-## 环境
+## Input overlay
 
-- Dalamud API Level **15**
-- .NET **10**
-- 客户端版本：FFXIV 7.5
+The plugin provides a native ImGui input overlay for web fields that cannot receive IME text inside the in-game browser.
 
-API Level 不匹配的客户端无法安装本插件。
+Starting with `1.7.89`, new installations automatically scale the overlay from:
 
-## 从源码构建
+- the current game window resolution;
+- the Dalamud interface scale.
+
+For example, a 3840×2160 display at 150% UI scale resolves to:
+
+```text
+overlay scale: 1.500
+font scale: 1.20
+```
+
+Existing `field-align.txt` files keep their manually calibrated values. Automatic scaling can be enabled or disabled from the plugin settings.
+
+## Page discovery
+
+The plugin does not bundle a front desk page. It looks for a user-provided page in this order:
+
+1. A page file or directory written in `page.txt` beside the plugin.
+2. `app.html` or `index.html` in the current web-data directory, including the localized upload-copy folder.
+3. `app.html` or `index.html` beside the plugin.
+4. `www/app.html` or `www/index.html` beside the plugin.
+5. `www/{profile}/app.html` or `www/{profile}/index.html` beside the plugin.
+
+The profile can be `generic`, `inpa`, or `princeton`. Programs, file paths, and plugin interface labels remain in Chinese for existing users.
+
+## Build from source
 
 ```bash
 git clone https://github.com/SuperBXO-O/INPABridge.git
@@ -49,39 +88,44 @@ cd INPABridge
 dotnet build -c Release
 ```
 
-产物在 `bin/Release/`：`INPABridge.dll` + `INPABridge.json` + `INPABridge.deps.json`。
+Build output is written to `bin/Release/`:
 
-## 插件包结构
+- `INPABridge.dll`
+- `INPABridge.json`
+- `INPABridge.deps.json`
 
-`latest.zip` 内容：
+Run the input-scaling unit tests with:
 
+```bash
+dotnet run --project tests/FieldScalePolicyTests/FieldScalePolicyTests.csproj -c Release
 ```
+
+## Package layout
+
+Versioned plugin archives contain:
+
+```text
 INPABridge.dll
 INPABridge.json
 INPABridge.deps.json
 field-theme.txt
 ```
 
-说明：
+## Release notes
 
-- **本插件不内置网页**，只提供本机 HTTP 服务（`127.0.0.1:18500`）与游戏内联动能力。
-- `field-theme.txt` 决定游戏内输入框配色，不是编译产物。
-- 页面由使用者自行提供，插件按以下顺序查找：
-  1. 插件目录下 `page.txt` 里写的页面文件或文件夹路径
-  2. 当前网页数据目录下的 `app.html` / `index.html` / `上传用/index.html`
-  3. 插件目录下 `app.html` / `index.html`
-  4. 插件目录下 `www/app.html` / `www/index.html`
-  5. 插件目录下 `www/{profile}/app.html` / `www/{profile}/index.html`
+### 1.7.89
 
-  其中 `profile` 取值 `generic` / `inpa` / `princeton`，游戏内可在插件窗口切换。
+- Added automatic input-overlay sizing from display resolution and Dalamud UI scale.
+- Preserved existing manual calibration values.
+- Changed plugin metadata author to `SuperBXO-O`.
 
-## 1.7.88
+### 1.7.88
 
-- 双绑定业务交易时，等上一件物品的数量框和右键菜单完全关闭后再放入下一件，避免只放入第一件。
-- 同步最新前台页面及输入框主题、独立档案目录和房间状态发送逻辑。
+- Fixed two-item trade placement by waiting for the previous quantity dialog and context menu to close before processing the next item.
+- Synchronized the latest page, field-theme, profile-directory, and room-status behavior.
 
-## 许可
+## License
 
-AGPL-3.0，详见 [LICENSE](LICENSE)。
+This project is licensed under the GNU Affero General Public License v3.0. See [LICENSE](LICENSE).
 
-本插件参考了 Dalamud 的部分实现（同为 AGPL-3.0）。
+The plugin includes work derived from Dalamud, which is also licensed under AGPL-3.0.

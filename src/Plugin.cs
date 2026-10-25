@@ -541,7 +541,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 				{
 					ok = true,
 					name = "INPA Bridge",
-					version = "1.7.87",
+					version = "1.7.89",
 					api = 15,
 					port = 18500,
 					bound = boundPrefix
@@ -3322,6 +3322,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 
 		// ---- 输入框覆盖层对齐参数（CSS 像素与游戏 UI 像素比例未知，标定一次即可） ----
 	private static float fieldScale = 1f, fieldDx, fieldDy, fieldRadius = 4f, fieldFontScale = 1f;
+	private static bool fieldAutoScale = true;
 	/* 覆盖层配色（RGBA 0..1）。默认和 INPA 页面 CSS 一致。 */
 	private static Vector4 fieldBg = new Vector4(0.031f, 0.031f, 0.031f, 1f);
 	private static Vector4 fieldBorder = new Vector4(0.231f, 0.239f, 0.271f, 1f);
@@ -3503,7 +3504,11 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 	
 	private static void LoadFieldAlign()
 	{
-		if (alignLoaded) return;
+		if (alignLoaded)
+		{
+			if (fieldAutoScale) ApplyAutoFieldScale();
+			return;
+		}
 		alignLoaded = true;
 		LoadFieldLayoutMode();
 		try
@@ -3512,11 +3517,20 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 			var p = FieldAlignFile();
 			if (p != null && File.Exists(p))
 			{
+				// Old calibration files keep their manual values unless auto mode
+				// was explicitly enabled and saved.
+				fieldAutoScale = false;
 				foreach (var line in File.ReadAllLines(p))
 				{
 					var kv = line.Split((char)61);
 					if (kv.Length != 2) continue;
 					var k = kv[0].Trim();
+					if (k == "autoscale")
+					{
+						fieldAutoScale = kv[1].Trim() == "1" ||
+							kv[1].Trim().Equals("true", StringComparison.OrdinalIgnoreCase);
+						continue;
+					}
 					if (k == "bg") { fieldBg = ParseColor(kv[1], fieldBg); hasBg = true; continue; }
 					if (k == "border") { fieldBorder = ParseColor(kv[1], fieldBorder); hasBorder = true; continue; }
 					if (k == "text") { fieldText = ParseColor(kv[1], fieldText); hasText = true; continue; }
@@ -3550,8 +3564,20 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 						fieldRadius = Math.Clamp(r, 0f, 24f);
 				}
 			}
+			if (fieldAutoScale) ApplyAutoFieldScale();
 		}
 		catch { }
+	}
+
+	private static void ApplyAutoFieldScale()
+	{
+		var io = ImGui.GetIO();
+		var result = FieldScalePolicy.Compute(
+			io.DisplaySize.X,
+			io.DisplaySize.Y,
+			Dalamud.Interface.Utility.ImGuiHelpers.GlobalScale);
+		fieldScale = result.BoxScale;
+		fieldFontScale = result.FontScale;
 	}
 	
 	private static void SaveFieldAlign()
@@ -3560,7 +3586,8 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		{
 			var p = FieldAlignFile();
 			if (p == null) return;
-			File.WriteAllText(p, "scale=" + fieldScale.ToString("0.####", CultureInfo.InvariantCulture)
+			File.WriteAllText(p, "autoscale=" + (fieldAutoScale ? "1" : "0")
+				+ Environment.NewLine + "scale=" + fieldScale.ToString("0.####", CultureInfo.InvariantCulture)
 				+ Environment.NewLine + "dx=" + fieldDx.ToString("0.##", CultureInfo.InvariantCulture)
 				+ Environment.NewLine + "dy=" + fieldDy.ToString("0.##", CultureInfo.InvariantCulture)
 				+ Environment.NewLine + "radius=" + fieldRadius.ToString("0.##", CultureInfo.InvariantCulture)
@@ -3593,18 +3620,36 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 				(fieldLayoutMode == 0 ? "" : "；当前手动覆盖为" + FieldLayoutName(fieldLayoutMode)));
 			ImGui.TextWrapped("自动模式会按当前网页版本及皮肤切换黑黄 / 蓝白 / 橙白 / 霓虹青；手动模式优先使用所选版式。");
 			ImGui.Separator();
+			if (ImGui.Checkbox("自动适配界面", ref fieldAutoScale))
+			{
+				if (fieldAutoScale) ApplyAutoFieldScale();
+				SaveFieldAlign();
+			}
+			if (fieldAutoScale)
+			{
+				var io = ImGui.GetIO();
+				ImGui.TextWrapped("当前显示 " + Math.Round(io.DisplaySize.X) + "×" + Math.Round(io.DisplaySize.Y)
+					+ "，界面缩放 " + (Dalamud.Interface.Utility.ImGuiHelpers.GlobalScale * 100f).ToString("0.#", CultureInfo.InvariantCulture)
+					+ "% → 输入框 " + fieldScale.ToString("0.000", CultureInfo.InvariantCulture)
+					+ " / 字号 " + fieldFontScale.ToString("0.00", CultureInfo.InvariantCulture));
+				ImGui.TextWrapped("切换分辨率、显示器或界面缩放后会自动重新计算；需要精调时可关闭自动适配。");
+			}
 			ImGui.TextWrapped("先点一下页面里的输入框（会出现一个覆盖框），再拖下面的滑块让它和页面的框完全重合；颜色在下面调。改完点保存。");
 			ImGui.Spacing();
+			ImGui.BeginDisabled(fieldAutoScale);
 			ImGui.SetNextItemWidth(300f);
 			ImGui.SliderFloat("缩放", ref fieldScale, 0.5f, 2f, "%.3f");
+			ImGui.EndDisabled();
 			ImGui.SetNextItemWidth(300f);
 			ImGui.SliderFloat("左右偏移", ref fieldDx, -150f, 150f, "%.0f");
 			ImGui.SetNextItemWidth(300f);
 			ImGui.SliderFloat("上下偏移", ref fieldDy, -60f, 60f, "%.0f");
 			ImGui.SetNextItemWidth(300f);
 			ImGui.SliderFloat("圆角", ref fieldRadius, 0f, 20f, "%.0f");
+			ImGui.BeginDisabled(fieldAutoScale);
 			ImGui.SetNextItemWidth(300f);
 			ImGui.SliderFloat("字号（1.00 = 和页面一样大）", ref fieldFontScale, 0.1f, 1.6f, "%.2f");
+			ImGui.EndDisabled();
 			ImGui.Spacing();
 			ImGui.TextColored(new Vector4(0.85f, 0.72f, 0.35f, 1f), "颜色");
 			ImGui.SetNextItemWidth(300f);
@@ -3623,6 +3668,8 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 			if (ImGui.Button("重置", new Vector2(90f, 0f)))
 			{
 				fieldScale = 1f; fieldDx = 0f; fieldDy = 0f; fieldRadius = 4f; fieldFontScale = 1f;
+				fieldAutoScale = true;
+				ApplyAutoFieldScale();
 				fieldBg = new Vector4(0.031f, 0.031f, 0.031f, 1f);
 				fieldBorder = new Vector4(0.231f, 0.239f, 0.271f, 1f);
 				fieldText = new Vector4(0.929f, 0.929f, 0.929f, 1f);
