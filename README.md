@@ -119,7 +119,6 @@ NOTICE
 
 - Added automatic input-overlay sizing from display resolution and Dalamud UI scale.
 - Preserved existing manual calibration values.
-- Changed plugin metadata author to `SuperBXO-O`.
 - Added the complete AGPL-3.0 license and attribution notice to the plugin archive.
 
 ### 1.7.88
