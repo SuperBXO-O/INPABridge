@@ -109,6 +109,8 @@ INPABridge.dll
 INPABridge.json
 INPABridge.deps.json
 field-theme.txt
+LICENSE
+NOTICE
 ```
 
 ## Release notes
@@ -118,6 +120,7 @@ field-theme.txt
 - Added automatic input-overlay sizing from display resolution and Dalamud UI scale.
 - Preserved existing manual calibration values.
 - Changed plugin metadata author to `SuperBXO-O`.
+- Added the complete AGPL-3.0 license and attribution notice to the plugin archive.
 
 ### 1.7.88
 

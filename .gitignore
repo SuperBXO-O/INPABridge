@@ -5,9 +5,10 @@ obj/
 *.suo
 .vs/
 
-# 本地发布包（走 GitHub Release，不进版本库）
+# 本地发布暂存目录；版本化插件包需要跟随 Custom Repository 提交。
 releases/
 *.zip
+!/INPABridge-*.zip
 
 # 备份文件
 *.bak
