@@ -114,7 +114,6 @@ Versioned plugin archives contain:
 INPABridge.dll
 INPABridge.json
 INPABridge.deps.json
-index.html
 field-theme.txt
 LICENSE
 NOTICE
@@ -127,7 +126,6 @@ NOTICE
 - Fixed room alerts reading the plugin's default data directory instead of the active web profile's shared data file.
 - Added regression coverage for `inpa`, `princeton`, and `generic` room-alert profiles, including due alerts and duplicate suppression.
 - Unified the ticket whitelist target picker with the target controls used elsewhere.
-- Included the latest INPA front-desk page in the release archive so plugin updates keep the embedded page available.
 
 ### 1.7.89
 
