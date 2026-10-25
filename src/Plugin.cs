@@ -541,7 +541,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 				{
 					ok = true,
 					name = "INPA Bridge",
-					version = "1.7.89",
+					version = "1.7.90",
 					api = 15,
 					port = 18500,
 					bound = boundPrefix
@@ -4710,89 +4710,31 @@ case "reload": BwOverlay("reload"); break;
 
 	private void CheckRoomsOnce()
 	{
-		var path = StateFile();
-		if (path == null || !File.Exists(path)) return;
-		string text;
-		try { text = File.ReadAllText(path, Encoding.UTF8); }
-		catch { return; }
-
-		JsonDocument doc;
-		try { doc = JsonDocument.Parse(text); }
-		catch { return; }
-		using (doc)
-		{
-			var root = doc.RootElement;
-			if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object) return;
-
-			bool on = true;
-			int preMin = 5;
-			if (data.TryGetProperty("roomAlert", out var ra) && ra.ValueKind == JsonValueKind.Object)
-			{
-				if (ra.TryGetProperty("on", out var o) && (o.ValueKind == JsonValueKind.True || o.ValueKind == JsonValueKind.False)) on = o.GetBoolean();
-				if (ra.TryGetProperty("preMin", out var pm) && pm.ValueKind == JsonValueKind.Number) { try { preMin = pm.GetInt32(); } catch { } }
-			}
-			if (!on) return;
-			if (!data.TryGetProperty("roomLog", out var log) || log.ValueKind != JsonValueKind.Array) return;
-
-			long now = DateTimeOffset.Now.ToUnixTimeMilliseconds();
-			foreach (var rec in log.EnumerateArray())
-			{
-				if (rec.ValueKind != JsonValueKind.Object) continue;
-				if (rec.TryGetProperty("end", out var endEl) && endEl.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(endEl.GetString())) continue;
-
-				long start = 0;
-				if (rec.TryGetProperty("startMs", out var sm) && sm.ValueKind == JsonValueKind.Number) { try { start = sm.GetInt64(); } catch { } }
-				if (start <= 0 && rec.TryGetProperty("start", out var st) && st.ValueKind == JsonValueKind.String) start = ParseStartMs(st.GetString());
-				if (start <= 0) continue;
-
-				double hours = 0;
-				if (rec.TryGetProperty("hours", out var hEl) && hEl.ValueKind == JsonValueKind.Number) { try { hours = hEl.GetDouble(); } catch { } }
-				if (hours <= 0) continue;
-
-				long due = start + (long)(hours * 3600.0 * 1000.0);
-				string roomNo = rec.TryGetProperty("roomNo", out var rn) ? (rn.GetString() ?? "") : "";
-				string staff = rec.TryGetProperty("staff", out var sf) ? (sf.GetString() ?? "") : "";
-				string id = rec.TryGetProperty("id", out var idEl) ? idEl.ToString() : "";
-				string who = (staff.Length > 0 ? staff + " 的 " : "") + roomNo + " 号房";
-
-				long preAt = due - (long)preMin * 60000L;
-				string tag = (StateFile() ?? "") + "|" + id;   // 带上店铺（数据文件），两个店同号房间不会互相顶掉提醒
-				if (now >= due)
-				{
-					if (roomFired.Add(tag + "|due"))
-					{
-						NotifyGame("【" + ShopLabel() + " 包间】" + who + " 已到时间，请确认续时或结束");
-						Audit("包间提醒（到点）：" + who);
-					}
-				}
-				else if (preMin > 0 && now >= preAt)
-				{
-					if (roomFired.Add(tag + "|pre"))
-					{
-						NotifyGame("【" + ShopLabel() + " 包间】" + who + " 还有 " + preMin + " 分钟到点");
-						Audit("包间提醒（提前 " + preMin + " 分钟）：" + who);
-					}
-				}
-			}
-		}
-	}
-
-	/// <summary>兼容老记录：把 "2026/10/11 1:33:58" 这样的字符串解析成毫秒时间戳。</summary>
-	private static long ParseStartMs(string? s)
-	{
-		if (string.IsNullOrEmpty(s)) return 0;
-		var m = Regex.Match(s!, @"(\d{4})\D+(\d{1,2})\D+(\d{1,2})\D+(\d{1,2}):(\d{1,2}):?(\d{1,2})?");
-		if (!m.Success) return 0;
+		string? pageHtml = null;
 		try
 		{
-			var dt = new DateTime(
-				int.Parse(m.Groups[1].Value), int.Parse(m.Groups[2].Value), int.Parse(m.Groups[3].Value),
-				int.Parse(m.Groups[4].Value), int.Parse(m.Groups[5].Value),
-				(m.Groups[6].Success && m.Groups[6].Value.Length > 0) ? int.Parse(m.Groups[6].Value) : 0,
-				DateTimeKind.Local);
-			return new DateTimeOffset(dt).ToUnixTimeMilliseconds();
+			var page = ResolvePagePath();
+			if (page != null) pageHtml = File.ReadAllText(page, Encoding.UTF8);
 		}
-		catch { return 0; }
+		catch { }
+
+		var source = RoomAlertPolicy.ResolveSource(
+			pageHtml,
+			profile => StateFile(profile),
+			StateFile(),
+			ShopLabel());
+		if (source == null) return;
+
+		var notices = RoomAlertPolicy.Scan(
+			source.DataPath,
+			source.ShopLabel,
+			DateTimeOffset.Now.ToUnixTimeMilliseconds(),
+			roomFired);
+		foreach (var notice in notices)
+		{
+			NotifyGame(notice.Text);
+			Audit(notice.AuditText);
+		}
 	}
 
 	/// <summary>往游戏聊天里发一条只有自己看得见的默语（/echo）。</summary>
