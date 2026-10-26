@@ -121,6 +121,12 @@ NOTICE
 
 ## Release notes
 
+### 1.7.92
+
+- Prevented background requests from changing the active field profile and causing the input overlay to flicker between theme presets.
+- Added regression coverage for stable INPA, Princeton, and Generic field themes.
+- Updated the companion web page so Browsingway keeps the native mouse cursor instead of running the browser-only custom cursor.
+
 ### 1.7.91
 
 - Added a local physical-modifier endpoint so Ctrl-click multi-select works inside the Browsingway in-game window even when CEF does not include `ctrlKey` on mouse events.

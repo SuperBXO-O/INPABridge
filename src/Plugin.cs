@@ -429,7 +429,6 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 		var origin = request.Headers["Origin"] ?? "";
 		var pathNow = (request.Url?.AbsolutePath ?? "/").ToLowerInvariant();
 		var webProfile = NormalizeWebProfile(ProfileName(request));
-		if (webProfile.Length > 0) fieldDetectedProfile = webProfile;
 		var pingRoute = pathNow == "/ping";
 		var pageRoute = IsPageRoute(request.Url?.AbsolutePath ?? "/");
 		bool originOk = OriginAllowed(origin);
@@ -3375,11 +3374,7 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 
 	private static int FieldLayoutModeForProfile(string? profile, Vector4 accent)
 	{
-		var normalized = NormalizeWebProfile(profile);
-		if (normalized == InpaWebProfile) return 1;
-		if (normalized == PrincetonWebProfile) return 2;
-		if (normalized == GenericWebProfile) return IsCyberCyanAccent(accent) ? 4 : 3;
-		return 0;
+		return FieldThemePolicy.LayoutModeForProfile(profile, IsCyberCyanAccent(accent));
 	}
 
 	private static string FieldLayoutName(int mode)
@@ -3902,6 +3897,11 @@ public sealed class Plugin : IDalamudPlugin, IDisposable
 			   同一份插件也能在 INPA / 普林斯顿 / 通用版之间即时切换配色。 */
 			if (active)
 			{
+				/* 只有正在编辑的输入框请求才能改变自动主题档案。
+				   其他页面、探活和后台轮询不能覆盖它，否则输入框会在
+				   黑黄 / 橙白等版式之间反复跳色。 */
+				fieldDetectedProfile = FieldThemePolicy.UpdateDetectedProfile(
+					fieldDetectedProfile, ProfileName(req), editingRequest: true);
 				var bg = S("fbg");
 				var border = S("fborder");
 				var text = S("ftx");
